@@ -1,106 +1,81 @@
-name: Build Cronet Multi-Platform
+name: Build Chromium net desktop components
 
 on:
   workflow_dispatch:
+    inputs:
+      chromium_version:
+        description: 'Chromium tag to build (pin this value)'
+        required: true
+        default: '153.0.8010.36'
+        type: string
+
+# This builds Chromium's desktop //net component. Chromium's official Cronet
+# target is Android-only; //net is the closest upstream desktop target and is
+# an internal component, not a standalone Cronet-compatible C API.
 
 jobs:
-  # =======================================================
-  # 任务 1：动态获取 Chromium 最新稳定版本 Tag
-  # =======================================================
-  get-version:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.tag }}
-    steps:
-      - id: version
-        name: "查询 Chromium 最新版本号"
-        run: |
-          VERSION=$(curl -s "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Linux&num=1" | jq -r '.[0].version')
-          echo "tag=$VERSION" >> $GITHUB_OUTPUT
-          echo "Target Version: $VERSION"
-
-  # =======================================================
-  # 任务 2：矩阵并发编译 Linux (.so) 与 Windows (.dll)
-  # =======================================================
   build:
-    needs: get-version
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - platform: linux-x64
+            runner: ubuntu-22.04
             target_os: linux
-            artifact_name: cronet-linux-so
-          - os: windows-latest
+            artifact: chromium-net-linux-x64
+          - platform: windows-x64
+            runner: windows-2022
             target_os: win
-            artifact_name: cronet-windows-dll
+            artifact: chromium-net-windows-x64
 
-    runs-on: ${{ matrix.os }}
+    env:
+      CHROMIUM_VERSION: ${{ inputs.chromium_version }}
+      DEPOT_TOOLS_UPDATE: '0'
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+
     steps:
-      # ---------------- Linux 环境初始化与磁盘清理 ----------------
-      - name: "Linux - 清理磁盘与安装基础依赖"
-        if: matrix.os == 'ubuntu-latest'
+      - uses: actions/checkout@v4
+
+      - name: Install Linux host dependencies
+        if: runner.os == 'Linux'
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo docker image prune --all --force
           sudo apt-get update
-          sudo apt-get install -y git python3 curl pkg-config
+          sudo apt-get install -y ca-certificates git ninja-build pkg-config python3
 
-          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $HOME/depot_tools
-          echo "$HOME/depot_tools" >> $GITHUB_PATH
-
-      # ---------------- Windows 环境初始化与磁盘清理 ----------------
-      - name: "Windows - 深度清理磁盘释放空间 (腾出 30GB+)"
-        if: matrix.os == 'windows-latest'
+      - name: Configure Windows host
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Write-Host "=== 清理前 C 盘可用空间 ==="
-          Get-PSDrive C | Select-Object @{Name="Free Space (GB)"; Expression={[math]::round($_.Free/1GB,2)}}
-
-          $targets = @(
-            "C:\Program Files (x86)\Android",
-            "C:\hostedtoolcache\windows\Ruby",
-            "C:\hostedtoolcache\windows\Java",
-            "C:\hostedtoolcache\windows\go",
-            "C:\hostedtoolcache\windows\CodeQL",
-            "C:\Program Files\dotnet"
-          )
-
-          foreach ($path in $targets) {
-            if (Test-Path $path) {
-              Write-Host "正在清理: $path ..."
-              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $path
-            }
-          }
-
-          Write-Host "=== 清理后 C 盘可用空间 ==="
-          Get-PSDrive C | Select-Object @{Name="Free Space (GB)"; Expression={[math]::round($_.Free/1GB,2)}}
-
-      - name: "Windows - 配置长路径、Git 与 depot_tools"
-        if: matrix.os == 'windows-latest'
-        shell: bash
-        run: |
-          git config --system core.longpaths true
-          git config --global user.name "CronetBuilder"
-          git config --global user.email "builder@local.host"
+          git config --global core.longpaths true
           git config --global core.autocrlf false
           git config --global depot-tools.allowGlobalGitConfig false
 
-          curl -s -L -o depot_tools.zip https://storage.googleapis.com/chrome-infra/depot_tools.zip
-          7z x depot_tools.zip -o"C:/depot_tools"
-          echo "C:/depot_tools" >> $GITHUB_PATH
-
-          echo "DEPOT_TOOLS_WIN_TOOLCHAIN=0" >> $GITHUB_ENV
-          echo 'WINDOWSSDKDIR=C:\Program Files (x86)\Windows Kits\10' >> $GITHUB_ENV
-
-      # ---------------- 浅克隆指定版本源码 (双平台通用) ----------------
-      - name: "拉取指定版本 Chromium 源码 (Shallow Clone)"
+      - name: Install depot_tools
         shell: bash
         run: |
-          mkdir -p $HOME/chromium
-          cd $HOME/chromium
+          set -euxo pipefail
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
+          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
 
-          cat <<EOF > .gclient
+      - name: Cache Chromium toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/chromium/src/third_party/llvm-build/Release+Asserts
+            ${{ runner.temp }}/chromium/src/third_party/gn
+            ${{ runner.temp }}/chromium/src/gn
+          key: chromium-${{ matrix.platform }}-${{ inputs.chromium_version }}-v1
+
+      - name: Check out Chromium and synchronize dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/chromium"
+          cd "$RUNNER_TEMP/chromium"
+          cat > .gclient <<'EOF'
           solutions = [
             {
               "name": "src",
@@ -109,68 +84,60 @@ jobs:
               "custom_deps": {},
               "custom_vars": {
                 "checkout_nacl": False,
-                "checkout_pgo_profiles": False
+                "checkout_pgo_profiles": False,
               },
             },
           ]
           EOF
-
-          git clone --depth 1 --branch "${{ needs.get-version.outputs.version }}" https://chromium.googlesource.com/chromium/src.git src
-
-      # ---------------- 同步构建工具链 (Linux 标准 sysroot 下载) ----------------
-      - name: "同步构建工具链与 Clang"
-        shell: bash
-        run: |
-          cd $HOME/chromium
-          gclient sync -D --no-history --shallow --nohooks
-
-          cd src
-          if [ "${{ matrix.target_os }}" = "linux" ]; then
-            # 1. 官方标准下载 Debian sysroot，自带所有 GTK/glib 等头文件，杜绝系统污染
-            python3 build/linux/sysroot_scripts/install-sysroot.py --arch=amd64
-            # 2. 拉取配套 Clang
-            python3 tools/clang/scripts/update.py
-          fi
+          git clone --depth=1 --branch "$CHROMIUM_VERSION" \
+            https://chromium.googlesource.com/chromium/src.git src
+          gclient sync --no-history --shallow --nohooks
           gclient runhooks
 
-      # ---------------- 生成 GN 配置并执行 Ninja 编译 ----------------
-      - name: "编译 Cronet"
+      - name: Install Linux sysroot
+        if: runner.os == 'Linux'
         shell: bash
+        working-directory: ${{ runner.temp }}/chromium/src
+        run: python3 build/linux/sysroot_scripts/install-sysroot.py --arch=amd64
+
+      - name: Generate GN files
+        shell: bash
+        working-directory: ${{ runner.temp }}/chromium/src
+        env:
+          TARGET_OS: ${{ matrix.target_os }}
         run: |
-          cd $HOME/chromium/src
-
-          # 关键防错参数：
-          # is_cronet_build=true：核心！彻底裁掉 UI/GTK/CUPS/Blink 测试！
-          # use_sysroot=true (Linux)：使用官方自带的干净环境，不再探针宿主机
-          COMMON_ARGS='is_cronet_build=true is_debug=false symbol_level=0 is_component_build=false use_thin_lto=false treat_warnings_as_errors=false fatal_linker_warnings=false chrome_pgo_phase=0 enable_nacl=false'
-
-          if [ "${{ matrix.target_os }}" = "linux" ]; then
-            GN_ARGS="$COMMON_ARGS target_os=\"linux\" use_sysroot=true"
+          set -euxo pipefail
+          COMMON='is_debug=false is_component_build=true is_official_build=false symbol_level=0 use_thin_lto=false treat_warnings_as_errors=false fatal_linker_warnings=false chrome_pgo_phase=0 enable_nacl=false'
+          if [ "$TARGET_OS" = linux ]; then
+            GN_ARGS="$COMMON target_os=\"linux\" target_cpu=\"x64\" use_sysroot=true"
           else
-            WIN_SDK_VER=$(ls "C:/Program Files (x86)/Windows Kits/10/Include" | grep -E '^10\.' | sort -V | tail -n 1)
-            echo "==== Windows SDK: $WIN_SDK_VER ===="
-            GN_ARGS="$COMMON_ARGS target_os=\"win\" windows_sdk_version=\"$WIN_SDK_VER\""
+            GN_ARGS="$COMMON target_os=\"win\" target_cpu=\"x64\""
           fi
-
-          echo "GN Args: $GN_ARGS"
           gn gen out/Release --args="$GN_ARGS"
-          autoninja -C out/Release cronet
 
-      # ---------------- 收集并上传产物 ----------------
-      - name: "收集构建产物"
+      - name: Build Chromium net component
         shell: bash
+        working-directory: ${{ runner.temp }}/chromium/src
+        env:
+          TARGET_OS: ${{ matrix.target_os }}
         run: |
-          mkdir -p $GITHUB_WORKSPACE/dist
-          cd $HOME/chromium/src
-          if [ "${{ matrix.target_os }}" = "linux" ]; then
-            cp out/Release/libcronet.so $GITHUB_WORKSPACE/dist/
+          set -euxo pipefail
+          autoninja -C out/Release net
+          if [ "$TARGET_OS" = linux ]; then
+            test -f out/Release/libnet.so
+            cp out/Release/libnet.so "$GITHUB_WORKSPACE/"
           else
-            cp out/Release/cronet.dll $GITHUB_WORKSPACE/dist/
-            cp out/Release/cronet*.lib $GITHUB_WORKSPACE/dist/ 2>/dev/null || true
+            test -f out/Release/net.dll
+            cp out/Release/net.dll "$GITHUB_WORKSPACE/"
+            test ! -f out/Release/net.lib || cp out/Release/net.lib "$GITHUB_WORKSPACE/"
           fi
 
-      - name: "上传 Artifact 压缩包"
+      - name: Upload desktop net component
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}-${{ needs.get-version.outputs.version }}
-          path: ${{ github.workspace }}/dist/*
+          name: ${{ matrix.artifact }}-${{ inputs.chromium_version }}
+          if-no-files-found: error
+          path: |
+            ${{ github.workspace }}/libnet.so
+            ${{ github.workspace }}/net.dll
+            ${{ github.workspace }}/net.lib
