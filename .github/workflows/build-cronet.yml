@@ -1,185 +1,222 @@
-name: Build Cronet (Win & Linux)
+name: Build Chromium desktop net
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
+
+permissions:
+  contents: read
+
+# Chromium upstream Cronet is Android-only. This builds the desktop //net
+# component as shared libraries: libnet.so on Linux and net.dll on Windows.
 
 jobs:
-  # ==========================================
-  # Linux: 编译 libcronet.so
-  # ==========================================
-  build-linux:
+  latest:
+    name: Resolve latest Chromium Stable
     runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Free Disk Space
+      - id: version
+        name: Get latest Stable version
+        shell: bash
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          df -h
+          set -euo pipefail
+          json="$(curl --fail --location --retry 5 --retry-all-errors --silent --show-error \
+            'https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Linux&num=1')"
+          version="$(printf '%s' "$json" | node -e '
+            const fs = require("fs");
+            const value = JSON.parse(fs.readFileSync(0, "utf8"));
+            const release = Array.isArray(value) ? value[0] : value;
+            const version = release?.version;
+            if (!/^\d+\.\d+\.\d+\.\d+$/.test(version || "")) process.exit(1);
+            process.stdout.write(version);
+          ')"
+          git ls-remote --exit-code --refs \
+            https://chromium.googlesource.com/chromium/src.git \
+            "refs/tags/$version" >/dev/null
+          echo "Chromium version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Install Dependencies
+  build:
+    name: ${{ matrix.os }}
+    needs: latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux-x64
+            runner: ubuntu-22.04
+            target_os: linux
+            artifact: chromium-net-linux-x64
+          - os: windows-x64
+            runner: windows-2022
+            target_os: win
+            artifact: chromium-net-windows-x64
+
+    env:
+      CHROMIUM_VERSION: ${{ needs.latest.outputs.version }}
+      DEPOT_TOOLS_UPDATE: '0'
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux packages
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 python3-pip git curl build-essential pkg-config libglib2.0-dev libnss3-dev libdbus-1-dev
+          sudo apt-get install -y ca-certificates git ninja-build pkg-config python3
 
-      - name: Install depot_tools
+      - name: Configure Windows Git
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $HOME/depot_tools
-          echo "$HOME/depot_tools" >> $GITHUB_PATH
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+          git config --global depot-tools.allowGlobalGitConfig false
 
-      - name: Fetch Chromium Source (Shallow & Latest only)
+      - name: Install depot_tools on Linux
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
-          export PATH="$HOME/depot_tools:$PATH"
-          mkdir -p chromium && cd chromium
-          
-          # 禁止下载不相关的 Android / iOS 大包，节省 20GB+ 空间
-          cat << 'EOF' > .gclient
+          set -euxo pipefail
+          git clone --depth=1 --single-branch --no-tags \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$RUNNER_TEMP/depot_tools"
+          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Install depot_tools on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $depotTools = Join-Path $env:RUNNER_TEMP 'depot_tools'
+          git clone --depth=1 --single-branch --no-tags `
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git `
+            $depotTools
+          $depotTools | Out-File -FilePath $env:GITHUB_PATH -Encoding ascii -Append
+
+      - name: Cache Chromium tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/chromium/src/third_party/llvm-build/Release+Asserts
+            ${{ runner.temp }}/chromium/src/third_party/gn
+          key: chromium-tools-${{ matrix.os }}-${{ needs.latest.outputs.version }}
+
+      - name: Checkout Chromium without history on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/chromium"
+          cd "$RUNNER_TEMP/chromium"
+          cat > .gclient <<'EOF'
           solutions = [
             {
               "name": "src",
               "url": "https://chromium.googlesource.com/chromium/src.git",
-              "deps_file": "DEPS",
               "managed": False,
               "custom_deps": {},
               "custom_vars": {
-                "checkout_android": False,
-                "checkout_android_prebuilts": False,
-                "checkout_android_native_support": False,
-                "checkout_ios": False,
-                "checkout_mac": False,
-                "checkout_win": False,
-                "checkout_linux": True,
+                "checkout_nacl": False,
+                "checkout_pgo_profiles": False,
               },
             },
           ]
           EOF
-
-          # 仅浅拉取最新代码，不下载历史提交
-          gclient sync --no-history --shallow --nohooks -j 8
-
-          cd src
-          build/install-build-deps.sh --no-prompt --no-chromeos-fonts --no-android
+          git clone --depth=1 --single-branch --no-tags \
+            --branch "$CHROMIUM_VERSION" \
+            https://chromium.googlesource.com/chromium/src.git src
+          gclient sync --no-history --shallow --nohooks
           gclient runhooks
 
-      - name: GN Gen & Build Cronet (.so)
+      - name: Checkout Chromium without history on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          export PATH="$HOME/depot_tools:$PATH"
-          cd chromium/src
-          
-          mkdir -p out/Release
-          # 核心：通过 root_extra_deps 将 cronet 加入 Ninja 根构建树
-          cat << 'EOF' > out/Release/args.gn
-          is_component_build = false
-          is_debug = false
-          symbol_level = 0
-          blink_symbol_level = 0
-          v8_symbol_level = 0
-          use_custom_libcxx = true
-          treat_warnings_as_errors = false
-          root_extra_deps = [ "//components/cronet:cronet" ]
-          EOF
-
-          gn gen out/Release
-          
-          # 使用明确的组件目标进行编译
-          ninja -C out/Release components/cronet:cronet
-
-          # 列出产物以供确认
-          ls -lh out/Release/libcronet* || ls -lh out/Release/*cronet*
-
-      - name: Upload Linux Cronet (.so)
-        uses: actions/upload-artifact@v4
-        with:
-          name: cronet-linux
-          path: |
-            chromium/src/out/Release/libcronet*.so
-            chromium/src/out/Release/*cronet*.so
-
-
-  # ==========================================
-  # Windows: 编译 cronet.dll
-  # ==========================================
-  build-windows:
-    runs-on: windows-2022
-    steps:
-      - name: Configure Git Longpaths
-        shell: bash
-        run: |
-          git config --system core.longpaths true
-
-      - name: Install depot_tools
-        shell: bash
-        run: |
-          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git /c/depot_tools
-          echo "C:/depot_tools" >> $GITHUB_PATH
-          echo "DEPOT_TOOLS_WIN_TOOLCHAIN=0" >> $GITHUB_ENV
-
-      - name: Fetch Chromium Source (Shallow & Latest only)
-        shell: bash
-        run: |
-          export PATH="/c/depot_tools:$PATH"
-          mkdir -p /c/chromium && cd /c/chromium
-
-          cat << 'EOF' > .gclient
+          $chromiumRoot = Join-Path $env:RUNNER_TEMP 'chromium'
+          New-Item -ItemType Directory -Force -Path $chromiumRoot | Out-Null
+          Set-Location $chromiumRoot
+          @'
           solutions = [
             {
               "name": "src",
               "url": "https://chromium.googlesource.com/chromium/src.git",
-              "deps_file": "DEPS",
               "managed": False,
               "custom_deps": {},
               "custom_vars": {
-                "checkout_android": False,
-                "checkout_android_prebuilts": False,
-                "checkout_android_native_support": False,
-                "checkout_ios": False,
-                "checkout_mac": False,
-                "checkout_win": True,
-                "checkout_linux": False,
+                "checkout_nacl": False,
+                "checkout_pgo_profiles": False,
               },
             },
           ]
-          EOF
-
-          # 浅拉取
-          gclient sync --no-history --shallow --nohooks -j 8
-          cd src
+          '@ | Set-Content -LiteralPath .gclient -Encoding ascii
+          git clone --depth=1 --single-branch --no-tags `
+            --branch $env:CHROMIUM_VERSION `
+            https://chromium.googlesource.com/chromium/src.git src
+          gclient sync --no-history --shallow --nohooks
           gclient runhooks
 
-      - name: GN Gen & Build Cronet (.dll)
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        working-directory: ${{ runner.temp }}/chromium/src
+        run: |
+          ./build/install-build-dep.sh --no-prompt
+          python3 build/linux/sysroot_scripts/install-sysroot.py --arch=amd64
+
+      - name: Generate GN files on Linux
+        if: runner.os == 'Linux'
+        working-directory: ${{ runner.temp }}/chromium/src
         shell: bash
         run: |
-          export PATH="/c/depot_tools:$PATH"
-          cd /c/chromium/src
+          set -euxo pipefail
+          args='is_debug=false is_component_build=true is_official_build=false symbol_level=0 use_thin_lto=false treat_warnings_as_errors=false fatal_linker_warnings=false chrome_pgo_phase=0 enable_nacl=false target_os="linux" target_cpu="x64" use_sysroot=true'
+          gn gen out/Release --args="$args"
 
-          mkdir -p out/Release
-          # 核心：通过 root_extra_deps 将 cronet 加入 Ninja 根构建树
-          cat << 'EOF' > out/Release/args.gn
-          is_component_build = false
-          is_debug = false
-          symbol_level = 0
-          blink_symbol_level = 0
-          v8_symbol_level = 0
-          treat_warnings_as_errors = false
-          root_extra_deps = [ "//components/cronet:cronet" ]
-          EOF
+      - name: Generate GN files on Windows
+        if: runner.os == 'Windows'
+        working-directory: ${{ runner.temp }}/chromium/src
+        shell: pwsh
+        run: |
+          $args = 'is_debug=false is_component_build=true is_official_build=false symbol_level=0 use_thin_lto=false treat_warnings_as_errors=false fatal_linker_warnings=false chrome_pgo_phase=0 enable_nacl=false target_os="win" target_cpu="x64"'
+          gn gen out/Release --args=$args
 
-          gn gen out/Release
-          
-          # 使用明确的组件目标进行编译
-          ninja -C out/Release components/cronet:cronet
+      - name: Build only //net on Linux
+        if: runner.os == 'Linux'
+        working-directory: ${{ runner.temp }}/chromium/src
+        shell: bash
+        run: |
+          set -euxo pipefail
+          autoninja -C out/Release net
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          test -f out/Release/libnet.so
+          cp -L out/Release/libnet.so "$GITHUB_WORKSPACE/artifacts/libnet.so"
 
-          # 查看产物
-          ls -lh out/Release/cronet*
+      - name: Build only //net on Windows
+        if: runner.os == 'Windows'
+        working-directory: ${{ runner.temp }}/chromium/src
+        shell: pwsh
+        run: |
+          autoninja -C out/Release net
+          $artifactDir = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+          $netDll = Join-Path (Get-Location) 'out/Release/net.dll'
+          if (-not (Test-Path -LiteralPath $netDll)) {
+            throw 'Expected out/Release/net.dll was not produced'
+          }
+          Copy-Item -LiteralPath $netDll -Destination (Join-Path $artifactDir 'net.dll')
+          foreach ($name in @('net.dll.lib', 'net.lib')) {
+            $importLibrary = Join-Path (Get-Location) "out/Release/$name"
+            if (Test-Path -LiteralPath $importLibrary) {
+              Copy-Item -LiteralPath $importLibrary -Destination (Join-Path $artifactDir $name)
+            }
+          }
 
-      - name: Upload Windows Cronet (.dll & .lib)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cronet-windows
-          path: |
-            C:/chromium/src/out/Release/cronet*.dll
-            C:/chromium/src/out/Release/cronet*.lib
+          name: ${{ matrix.artifact }}-${{ needs.latest.outputs.version }}
+          if-no-files-found: error
+          path: ${{ github.workspace }}/artifacts/*
