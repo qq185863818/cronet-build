@@ -1,4 +1,4 @@
-name: Build Chromium desktop net
+name: Build Latest Chromium Cronet Linux x64
 
 on:
   workflow_dispatch:
@@ -6,217 +6,175 @@ on:
 permissions:
   contents: read
 
-# Chromium upstream Cronet is Android-only. This builds the desktop //net
-# component as shared libraries: libnet.so on Linux and net.dll on Windows.
-
 jobs:
-  latest:
-    name: Resolve latest Chromium Stable
-    runs-on: ubuntu-22.04
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    steps:
-      - id: version
-        name: Get latest Stable version
-        shell: bash
-        run: |
-          set -euo pipefail
-          json="$(curl --fail --location --retry 5 --retry-all-errors --silent --show-error \
-            'https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Linux&num=1')"
-          version="$(printf '%s' "$json" | node -e '
-            const fs = require("fs");
-            const value = JSON.parse(fs.readFileSync(0, "utf8"));
-            const release = Array.isArray(value) ? value[0] : value;
-            const version = release?.version;
-            if (!/^\d+\.\d+\.\d+\.\d+$/.test(version || "")) process.exit(1);
-            process.stdout.write(version);
-          ')"
-          git ls-remote --exit-code --refs \
-            https://chromium.googlesource.com/chromium/src.git \
-            "refs/tags/$version" >/dev/null
-          echo "Chromium version: $version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
   build:
-    name: ${{ matrix.os }}
-    needs: latest
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: linux-x64
-            runner: ubuntu-22.04
-            target_os: linux
-            artifact: chromium-net-linux-x64
-          - os: windows-x64
-            runner: windows-2022
-            target_os: win
-            artifact: chromium-net-windows-x64
+    runs-on: ubuntu-latest
 
     env:
-      CHROMIUM_VERSION: ${{ needs.latest.outputs.version }}
-      DEPOT_TOOLS_UPDATE: '0'
-      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+      DEPOT_TOOLS: ${{ github.workspace }}/depot_tools
+      CHROMIUM_SRC: ${{ github.workspace }}/chromium/src
+      OUT_DIR: ${{ github.workspace }}/chromium/src/out/Release
+      DEPOT_TOOLS_UPDATE: "0"
+      CHROMIUM_GIT_CREDENTIAL_HELPER: "none"
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Linux packages
-        if: runner.os == 'Linux'
+      - name: Show runner information
+        shell: bash
         run: |
+          set -euxo pipefail
+          uname -a
+          uname -m
+          lsb_release -a || true
+          echo "CPU:" && nproc
+          echo "Memory:" && free -h
+          echo "Disk:" && df -hT
+          test "$(uname -m)" = "x86_64"
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "Before cleanup:"
+          df -hT
+          sudo rm -rf /usr/local/lib/android /usr/local/share/powershell /usr/share/dotnet /opt/ghc /opt/hostedtoolcache || true
+          sudo docker system prune -af || true
+          sudo apt-get clean || true
+          echo "After cleanup:"
+          df -hT
+
+      - name: Install base dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y ca-certificates git ninja-build pkg-config python3
+          sudo apt-get install -y \
+            ca-certificates \
+            curl \
+            git \
+            python3 \
+            python3-pip \
+            python3-venv \
+            lsb-release \
+            sudo \
+            file \
+            unzip \
+            zip \
+            bzip2 \
+            xz-utils \
+            rsync \
+            ninja-build \
+            ccache \
+            pkg-config \
+            patchelf \
+            elfutils
 
-      - name: Configure Windows Git
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          git config --global core.longpaths true
-          git config --global core.autocrlf false
-          git config --global depot-tools.allowGlobalGitConfig false
-
-      - name: Install depot_tools on Linux
-        if: runner.os == 'Linux'
+      - name: Install depot_tools
         shell: bash
         run: |
           set -euxo pipefail
-          git clone --depth=1 --single-branch --no-tags \
-            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
-            "$RUNNER_TEMP/depot_tools"
-          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
+          rm -rf "${DEPOT_TOOLS}"
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "${DEPOT_TOOLS}"
+          echo "${DEPOT_TOOLS}" >> "${GITHUB_PATH}"
+          echo "${DEPOT_TOOLS}/python-bin" >> "${GITHUB_PATH}"
+          git -C "${DEPOT_TOOLS}" rev-parse HEAD | tee "${GITHUB_WORKSPACE}/depot_tools_revision.txt"
 
-      - name: Install depot_tools on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $depotTools = Join-Path $env:RUNNER_TEMP 'depot_tools'
-          git clone --depth=1 --single-branch --no-tags `
-            https://chromium.googlesource.com/chromium/tools/depot_tools.git `
-            $depotTools
-          $depotTools | Out-File -FilePath $env:GITHUB_PATH -Encoding ascii -Append
-
-      - name: Cache Chromium tools
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ runner.temp }}/chromium/src/third_party/llvm-build/Release+Asserts
-            ${{ runner.temp }}/chromium/src/third_party/gn
-          key: chromium-tools-${{ matrix.os }}-${{ needs.latest.outputs.version }}
-
-      - name: Checkout Chromium without history on Linux
-        if: runner.os == 'Linux'
+      - name: Checkout latest Chromium main without history
         shell: bash
+        working-directory: ${{ github.workspace }}
         run: |
           set -euxo pipefail
-          mkdir -p "$RUNNER_TEMP/chromium"
-          cd "$RUNNER_TEMP/chromium"
-          cat > .gclient <<'EOF'
-          solutions = [
-            {
-              "name": "src",
-              "url": "https://chromium.googlesource.com/chromium/src.git",
-              "managed": False,
-              "custom_deps": {},
-              "custom_vars": {
-                "checkout_nacl": False,
-                "checkout_pgo_profiles": False,
-              },
-            },
-          ]
-          EOF
-          git clone --depth=1 --single-branch --no-tags \
-            --branch "$CHROMIUM_VERSION" \
-            https://chromium.googlesource.com/chromium/src.git src
-          gclient sync --no-history --shallow --nohooks
+          rm -rf "${GITHUB_WORKSPACE}/chromium"
+          fetch --nohooks --no-history chromium
+          cd "${CHROMIUM_SRC}"
+          git rev-parse HEAD | tee "${GITHUB_WORKSPACE}/chromium_revision.txt"
+          git log -1 --format='%H%n%ad%n%s' --date=iso-strict | tee "${GITHUB_WORKSPACE}/chromium_commit.txt"
+          git describe --always --tags > "${GITHUB_WORKSPACE}/chromium_describe.txt" || true
+
+      - name: Install Chromium official build dependencies
+        shell: bash
+        working-directory: ${{ env.CHROMIUM_SRC }}
+        run: |
+          set -euxo pipefail
+          sudo build/install-build-deps.sh --no-prompt
+
+      - name: Run Chromium hooks
+        shell: bash
+        working-directory: ${{ env.CHROMIUM_SRC }}
+        run: |
+          set -euxo pipefail
           gclient runhooks
 
-      - name: Checkout Chromium without history on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $chromiumRoot = Join-Path $env:RUNNER_TEMP 'chromium'
-          New-Item -ItemType Directory -Force -Path $chromiumRoot | Out-Null
-          Set-Location $chromiumRoot
-          @'
-          solutions = [
-            {
-              "name": "src",
-              "url": "https://chromium.googlesource.com/chromium/src.git",
-              "managed": False,
-              "custom_deps": {},
-              "custom_vars": {
-                "checkout_nacl": False,
-                "checkout_pgo_profiles": False,
-              },
-            },
-          ]
-          '@ | Set-Content -LiteralPath .gclient -Encoding ascii
-          git clone --depth=1 --single-branch --no-tags `
-            --branch $env:CHROMIUM_VERSION `
-            https://chromium.googlesource.com/chromium/src.git src
-          gclient sync --no-history --shallow --nohooks
-          gclient runhooks
-
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        working-directory: ${{ runner.temp }}/chromium/src
-        run: |
-          ./build/install-build-dep.sh --no-prompt
-          python3 build/linux/sysroot_scripts/install-sysroot.py --arch=amd64
-
-      - name: Generate GN files on Linux
-        if: runner.os == 'Linux'
-        working-directory: ${{ runner.temp }}/chromium/src
+      - name: Configure Linux kernel
         shell: bash
         run: |
           set -euxo pipefail
-          args='is_debug=false is_component_build=true is_official_build=false symbol_level=0 use_thin_lto=false treat_warnings_as_errors=false fatal_linker_warnings=false chrome_pgo_phase=0 enable_nacl=false target_os="linux" target_cpu="x64" use_sysroot=true'
-          gn gen out/Release --args="$args"
+          sudo sysctl -w vm.max_map_count=262144
+          sysctl vm.max_map_count
 
-      - name: Generate GN files on Windows
-        if: runner.os == 'Windows'
-        working-directory: ${{ runner.temp }}/chromium/src
-        shell: pwsh
-        run: |
-          $args = 'is_debug=false is_component_build=true is_official_build=false symbol_level=0 use_thin_lto=false treat_warnings_as_errors=false fatal_linker_warnings=false chrome_pgo_phase=0 enable_nacl=false target_os="win" target_cpu="x64"'
-          gn gen out/Release --args=$args
-
-      - name: Build only //net on Linux
-        if: runner.os == 'Linux'
-        working-directory: ${{ runner.temp }}/chromium/src
+      - name: Generate Cronet desktop Linux x64 GN files
         shell: bash
+        working-directory: ${{ env.CHROMIUM_SRC }}
         run: |
           set -euxo pipefail
-          autoninja -C out/Release net
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          test -f out/Release/libnet.so
-          cp -L out/Release/libnet.so "$GITHUB_WORKSPACE/artifacts/libnet.so"
+          rm -rf "${OUT_DIR}"
+          gn gen "${OUT_DIR}" --args='is_debug=false is_component_build=false target_os="linux" target_cpu="x64" symbol_level=0 blink_symbol_level=0 enable_nacl=false use_goma=false use_remoteexec=false treat_warnings_as_errors=false dcheck_always_on=false'
+          gn args "${OUT_DIR}" --list > "${GITHUB_WORKSPACE}/gn_args_list.txt"
+          gn desc "${OUT_DIR}" //components/cronet:cronet --tree > "${GITHUB_WORKSPACE}/cronet_target_tree.txt"
 
-      - name: Build only //net on Windows
-        if: runner.os == 'Windows'
-        working-directory: ${{ runner.temp }}/chromium/src
-        shell: pwsh
+      - name: Build Cronet shared library
+        shell: bash
+        working-directory: ${{ env.CHROMIUM_SRC }}
         run: |
-          autoninja -C out/Release net
-          $artifactDir = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
-          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
-          $netDll = Join-Path (Get-Location) 'out/Release/net.dll'
-          if (-not (Test-Path -LiteralPath $netDll)) {
-            throw 'Expected out/Release/net.dll was not produced'
-          }
-          Copy-Item -LiteralPath $netDll -Destination (Join-Path $artifactDir 'net.dll')
-          foreach ($name in @('net.dll.lib', 'net.lib')) {
-            $importLibrary = Join-Path (Get-Location) "out/Release/$name"
-            if (Test-Path -LiteralPath $importLibrary) {
-              Copy-Item -LiteralPath $importLibrary -Destination (Join-Path $artifactDir $name)
-            }
-          }
+          set -euxo pipefail
+          autoninja -C "${OUT_DIR}" //components/cronet:cronet
 
-      - name: Upload artifact
+      - name: Validate and collect libcronet.so
+        shell: bash
+        working-directory: ${{ env.CHROMIUM_SRC }}
+        run: |
+          set -euxo pipefail
+          CRONET_SO="$(find "${OUT_DIR}" -type f -name 'libcronet.so' -print -quit || true)"
+          if [ -z "${CRONET_SO}" ]; then
+            echo "ERROR: libcronet.so was not produced."
+            find "${OUT_DIR}" -type f -iname '*cronet*.so*' -print || true
+            exit 1
+          fi
+          file "${CRONET_SO}"
+          readelf -h "${CRONET_SO}"
+          file -b "${CRONET_SO}" | grep -q 'ELF 64-bit'
+          file -b "${CRONET_SO}" | grep -q 'x86-64'
+          mkdir -p "${GITHUB_WORKSPACE}/artifacts"
+          cp -L "${CRONET_SO}" "${GITHUB_WORKSPACE}/artifacts/libcronet.so"
+          {
+            echo "Chromium revision: $(cat "${GITHUB_WORKSPACE}/chromium_revision.txt")"
+            echo "depot_tools revision: $(cat "${GITHUB_WORKSPACE}/depot_tools_revision.txt")"
+            echo "Runner OS: $(lsb_release -ds 2>/dev/null || true)"
+            echo "Runner arch: $(uname -m)"
+            echo "Target: //components/cronet:cronet"
+          } > "${GITHUB_WORKSPACE}/artifacts/build_info.txt"
+          sha256sum "${GITHUB_WORKSPACE}/artifacts/libcronet.so" | tee "${GITHUB_WORKSPACE}/artifacts/libcronet.so.sha256"
+          ls -lah "${GITHUB_WORKSPACE}/artifacts"
+
+      - name: Upload Cronet artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}-${{ needs.latest.outputs.version }}
+          name: cronet-linux-x64-latest
+          path: |
+            artifacts/libcronet.so
+            artifacts/libcronet.so.sha256
+            artifacts/build_info.txt
+            chromium_revision.txt
+            chromium_commit.txt
+            chromium_describe.txt
+            depot_tools_revision.txt
+            gn_args_list.txt
+            cronet_target_tree.txt
           if-no-files-found: error
-          path: ${{ github.workspace }}/artifacts/*
+          compression-level: 0
+
+      - name: Final disk report
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          df -hT
