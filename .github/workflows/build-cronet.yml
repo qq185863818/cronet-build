@@ -1,7 +1,7 @@
 name: Build Cronet (Win & Linux)
 
 on:
-  workflow_dispatch: # 支持手动触发
+  workflow_dispatch:
   push:
     branches: [ main ]
 
@@ -24,7 +24,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 python3-pip git curl build-essential libglib2.0-dev libnss3-dev libdbus-1-dev
+          sudo apt-get install -y python3 python3-pip git curl build-essential pkg-config libglib2.0-dev libnss3-dev libdbus-1-dev
 
       - name: Install depot_tools
         run: |
@@ -36,7 +36,7 @@ jobs:
           export PATH="$HOME/depot_tools:$PATH"
           mkdir -p chromium && cd chromium
           
-          # 创建不包含历史版本的 gclient 配置
+          # 禁止下载不相关的 Android / iOS 大包，节省 20GB+ 空间
           cat << 'EOF' > .gclient
           solutions = [
             {
@@ -45,17 +45,24 @@ jobs:
               "deps_file": "DEPS",
               "managed": False,
               "custom_deps": {},
-              "custom_vars": {},
+              "custom_vars": {
+                "checkout_android": False,
+                "checkout_android_prebuilts": False,
+                "checkout_android_native_support": False,
+                "checkout_ios": False,
+                "checkout_mac": False,
+                "checkout_win": False,
+                "checkout_linux": True,
+              },
             },
           ]
           EOF
 
-          # --no-history 和 --shallow-submodules 极大减少下载量与历史记录
+          # 仅浅拉取最新代码，不下载历史提交
           gclient sync --no-history --shallow --nohooks -j 8
 
           cd src
-          # 安装系统依赖并执行环境 hooks
-          build/install-build-deps.sh --no-prompt --no-chromeos-fonts
+          build/install-build-deps.sh --no-prompt --no-chromeos-fonts --no-android
           gclient runhooks
 
       - name: GN Gen & Build Cronet (.so)
@@ -64,24 +71,33 @@ jobs:
           cd chromium/src
           
           mkdir -p out/Release
-          # 仅编译必要的 cronet 产物，关闭测试与非必要模块以节省时间和空间
+          # 核心：通过 root_extra_deps 将 cronet 加入 Ninja 根构建树
           cat << 'EOF' > out/Release/args.gn
           is_component_build = false
           is_debug = false
           symbol_level = 0
+          blink_symbol_level = 0
+          v8_symbol_level = 0
           use_custom_libcxx = true
           treat_warnings_as_errors = false
+          root_extra_deps = [ "//components/cronet:cronet" ]
           EOF
 
           gn gen out/Release
-          # 仅编译 cronet
-          ninja -C out/Release cronet
+          
+          # 使用明确的组件目标进行编译
+          ninja -C out/Release components/cronet:cronet
+
+          # 列出产物以供确认
+          ls -lh out/Release/libcronet* || ls -lh out/Release/*cronet*
 
       - name: Upload Linux Cronet (.so)
         uses: actions/upload-artifact@v4
         with:
           name: cronet-linux
-          path: chromium/src/out/Release/libcronet.*.so
+          path: |
+            chromium/src/out/Release/libcronet*.so
+            chromium/src/out/Release/*cronet*.so
 
 
   # ==========================================
@@ -90,7 +106,7 @@ jobs:
   build-windows:
     runs-on: windows-2022
     steps:
-      - name: Configure Git
+      - name: Configure Git Longpaths
         shell: bash
         run: |
           git config --system core.longpaths true
@@ -99,7 +115,6 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git /c/depot_tools
-          # depot_tools 必须在 PATH 最前端
           echo "C:/depot_tools" >> $GITHUB_PATH
           echo "DEPOT_TOOLS_WIN_TOOLCHAIN=0" >> $GITHUB_ENV
 
@@ -117,12 +132,20 @@ jobs:
               "deps_file": "DEPS",
               "managed": False,
               "custom_deps": {},
-              "custom_vars": {},
+              "custom_vars": {
+                "checkout_android": False,
+                "checkout_android_prebuilts": False,
+                "checkout_android_native_support": False,
+                "checkout_ios": False,
+                "checkout_mac": False,
+                "checkout_win": True,
+                "checkout_linux": False,
+              },
             },
           ]
           EOF
 
-          # 仅拉取最新 commit，不拉取历史
+          # 浅拉取
           gclient sync --no-history --shallow --nohooks -j 8
           cd src
           gclient runhooks
@@ -134,21 +157,29 @@ jobs:
           cd /c/chromium/src
 
           mkdir -p out/Release
+          # 核心：通过 root_extra_deps 将 cronet 加入 Ninja 根构建树
           cat << 'EOF' > out/Release/args.gn
           is_component_build = false
           is_debug = false
           symbol_level = 0
+          blink_symbol_level = 0
+          v8_symbol_level = 0
           treat_warnings_as_errors = false
+          root_extra_deps = [ "//components/cronet:cronet" ]
           EOF
 
           gn gen out/Release
-          # 仅编译 cronet
-          ninja -C out/Release cronet
+          
+          # 使用明确的组件目标进行编译
+          ninja -C out/Release components/cronet:cronet
 
-      - name: Upload Windows Cronet (.dll)
+          # 查看产物
+          ls -lh out/Release/cronet*
+
+      - name: Upload Windows Cronet (.dll & .lib)
         uses: actions/upload-artifact@v4
         with:
           name: cronet-windows
           path: |
-            C:/chromium/src/out/Release/cronet.dll
-            C:/chromium/src/out/Release/cronet.dll.lib
+            C:/chromium/src/out/Release/cronet*.dll
+            C:/chromium/src/out/Release/cronet*.lib
