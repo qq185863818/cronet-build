@@ -4,18 +4,24 @@ on:
   workflow_dispatch:
 
 jobs:
+  # =======================================================
+  # 任务 1：动态获取 Chromium 最新稳定版本 Tag
+  # =======================================================
   get-version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.tag }}
     steps:
       - id: version
-        name: "查询 Chromium 最新稳定版本号"
+        name: "查询 Chromium 最新版本号"
         run: |
           VERSION=$(curl -s "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Linux&num=1" | jq -r '.[0].version')
           echo "tag=$VERSION" >> $GITHUB_OUTPUT
           echo "Target Version: $VERSION"
 
+  # =======================================================
+  # 任务 2：矩阵并发编译 Linux (.so) 与 Windows (.dll)
+  # =======================================================
   build:
     needs: get-version
     strategy:
@@ -31,24 +37,24 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      # ==================== Linux 环境初始化 ====================
-      - name: "Linux - 清理磁盘并安装编译基础库"
+      # ---------------- Linux 环境初始化与磁盘清理 ----------------
+      - name: "Linux - 清理磁盘并安装宿主编译库"
         if: matrix.os == 'ubuntu-latest'
         run: |
           # 1. 深度清理
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo docker image prune --all --force
 
-          # 2. 安装 Linux 原生编译头文件和依赖（消除 sysroot 强依赖）
+          # 2. 安装 Linux 编译所需的所有核心头文件（包含 libcups2-dev 解决 cups-config 缺失）
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libglib2.0-dev libnss3-dev libdbus-1-dev
+          sudo apt-get install -y build-essential pkg-config libglib2.0-dev libnss3-dev libdbus-1-dev libcups2-dev
 
           # 3. 安装 depot_tools
           git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $HOME/depot_tools
           echo "$HOME/depot_tools" >> $GITHUB_PATH
 
-      # ==================== Windows 环境初始化 ====================
-      - name: "Windows - 深度清理磁盘释放空间"
+      # ---------------- Windows 环境初始化与磁盘清理 ----------------
+      - name: "Windows - 深度清理磁盘释放空间 (腾出 30GB+)"
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
@@ -74,7 +80,7 @@ jobs:
           Write-Host "=== 清理后 C 盘可用空间 ==="
           Get-PSDrive C | Select-Object @{Name="Free Space (GB)"; Expression={[math]::round($_.Free/1GB,2)}}
 
-      - name: "Windows - 配置长路径与 depot_tools"
+      - name: "Windows - 配置长路径、Git 与 depot_tools"
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
@@ -91,7 +97,7 @@ jobs:
           echo "DEPOT_TOOLS_WIN_TOOLCHAIN=0" >> $GITHUB_ENV
           echo 'WINDOWSSDKDIR=C:\Program Files (x86)\Windows Kits\10' >> $GITHUB_ENV
 
-      # ==================== 浅克隆指定版本源码 ====================
+      # ---------------- 浅克隆指定版本源码 (双平台通用) ----------------
       - name: "拉取指定版本 Chromium 源码 (Shallow Clone)"
         shell: bash
         run: |
@@ -115,7 +121,7 @@ jobs:
 
           git clone --depth 1 --branch "${{ needs.get-version.outputs.version }}" https://chromium.googlesource.com/chromium/src.git src
 
-      # ==================== 同步构建工具链 ====================
+      # ---------------- 同步构建工具链 ----------------
       - name: "同步构建工具链与 Clang"
         shell: bash
         run: |
@@ -123,21 +129,20 @@ jobs:
           gclient sync -D --no-history --shallow --nohooks
 
           cd src
-          # Linux 保证拉取 Chromium 定制的 Clang 编译器
           if [ "${{ matrix.target_os }}" = "linux" ]; then
             python3 tools/clang/scripts/update.py
           fi
           gclient runhooks
 
-      # ==================== 生成 GN 配置并编译 ====================
+      # ---------------- 生成 GN 配置并执行 Ninja 编译 ----------------
       - name: "编译 Cronet"
         shell: bash
         run: |
           cd $HOME/chromium/src
 
           if [ "${{ matrix.target_os }}" = "linux" ]; then
-            # 核心改进：use_sysroot=false 直接使用 Ubuntu Runner 本身环境，彻底规避缺失 sysroot 报错
-            GN_ARGS='is_debug=false symbol_level=0 is_component_build=false target_os="linux" use_thin_lto=false use_sysroot=false'
+            # 禁用与网络无关的多余特性（关闭打印和 cups），同时启用宿主系统模式
+            GN_ARGS='is_debug=false symbol_level=0 is_component_build=false target_os="linux" use_thin_lto=false use_sysroot=false enable_printing=false use_cups=false'
           else
             WIN_SDK_VER=$(ls "C:/Program Files (x86)/Windows Kits/10/Include" | grep -E '^10\.' | sort -V | tail -n 1)
             echo "==== Windows SDK: $WIN_SDK_VER ===="
@@ -148,7 +153,7 @@ jobs:
           gn gen out/Release --args="$GN_ARGS"
           autoninja -C out/Release cronet
 
-      # ==================== 收集并上传产物 ====================
+      # ---------------- 收集并上传产物 ----------------
       - name: "收集构建产物"
         shell: bash
         run: |
