@@ -144,8 +144,7 @@ jobs:
 
           is_debug = false
           is_component_build = false
-          is_official_build = true
-          is_cronet_build = true
+          is_official_build = false
 
           # Disable Chrome's PGO profile lookup because --no-history does not
           # checkout the optional profile files.
@@ -156,7 +155,7 @@ jobs:
           v8_symbol_level = 0
 
           dcheck_always_on = false
-                              EOF_GN
+          EOF_GN
 
           sed -i 's/^[[:space:]]\{10\}//' "$OUT_DIR/args.gn"
 
