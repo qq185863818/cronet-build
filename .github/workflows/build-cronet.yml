@@ -146,6 +146,7 @@ jobs:
             'is_component_build = false' \
             'is_official_build = false' \
             'is_cronet_build = true' \
+            'use_platform_icu_alternatives = false' \
             '' \
             '# Disable Chrome'"'"'s PGO profile lookup because --no-history does not' \
             '# checkout the optional profile files.' \
