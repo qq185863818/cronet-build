@@ -2,23 +2,23 @@ name: Build Latest Chromium Cronet Linux x64
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 2 * * *'
 
 permissions:
   contents: read
+
+concurrency:
+  group: build-latest-cronet-linux-x64
+  cancel-in-progress: true
 
 env:
   DEPOT_TOOLS: /home/runner/depot_tools
   CHROMIUM_ROOT: /home/runner/chromium
   CHROMIUM_SRC: /home/runner/chromium/src
   OUT_DIR: /home/runner/chromium/src/out/Cronet
-  GIT_TERMINAL_PROMPT: '0'
-  DEPOT_TOOLS_UPDATE: '1'
 
 jobs:
   linux-x64:
-    name: Linux x64 Cronet
+    name: Build Chromium Cronet Linux x64
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -27,19 +27,18 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           uname -a
-          lsb_release -a || true
           arch
           nproc
           free -h
           df -h /
+          python3 --version
+          git --version
 
-      - name: Install base packages
+      - name: Install basic host packages
         shell: bash
         run: |
           set -euxo pipefail
-          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
@@ -56,11 +55,33 @@ jobs:
             unzip \
             zip
 
+      - name: Install latest depot_tools and bootstrap
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf "$DEPOT_TOOLS"
+          git clone --depth=1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$DEPOT_TOOLS"
+
+          export PATH="$DEPOT_TOOLS:$PATH"
+
+          cd "$DEPOT_TOOLS"
+          ./ensure_bootstrap
+
+          test -f "$DEPOT_TOOLS/python3_bin_reldir.txt"
+
+          command -v gclient
+          command -v fetch
+          command -v autoninja
+
+          gclient --version || true
+
       - name: Install Chromium build dependencies
         shell: bash
         run: |
           set -euxo pipefail
-          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
           rm -rf /tmp/chromium-deps
           git clone --depth=1 \
@@ -68,6 +89,7 @@ jobs:
             /tmp/chromium-deps
 
           cd /tmp/chromium-deps
+
           sudo ./build/install-build-deps.sh \
             --no-prompt \
             --no-chromeos-fonts \
@@ -75,33 +97,11 @@ jobs:
 
           rm -rf /tmp/chromium-deps
 
-      - name: Install and bootstrap latest depot_tools
+      - name: Checkout latest Chromium main without Git history
         shell: bash
         run: |
           set -euxo pipefail
-          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-          rm -rf "$DEPOT_TOOLS"
-          git clone --depth=1 \
-            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
-            "$DEPOT_TOOLS"
-
-          cd "$DEPOT_TOOLS"
-          ./ensure_bootstrap
-
-          test -f "$DEPOT_TOOLS/python3_bin_reldir.txt"
-
           export PATH="$DEPOT_TOOLS:$PATH"
-          command -v gclient
-          command -v fetch
-          command -v autoninja
-          gclient --version
-
-      - name: Checkout latest Chromium main without history
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
           rm -rf "$CHROMIUM_ROOT"
           mkdir -p "$CHROMIUM_ROOT"
@@ -110,15 +110,17 @@ jobs:
           fetch --nohooks --no-history chromium
 
           cd "$CHROMIUM_SRC"
+          echo "Chromium revision:"
           git rev-parse HEAD | tee /home/runner/chromium_revision.txt
-          cat chrome/VERSION | tee /home/runner/chromium_version.txt
-          df -h /
 
-      - name: Sync dependencies and run Chromium hooks
+          echo "Chromium version:"
+          cat chrome/VERSION | tee /home/runner/chromium_version.txt
+
+      - name: Sync dependencies and run hooks
         shell: bash
         run: |
           set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          export PATH="$DEPOT_TOOLS:$PATH"
           cd "$CHROMIUM_SRC"
 
           gclient sync -D --force --reset --no-history
@@ -127,87 +129,97 @@ jobs:
           test -x "$CHROMIUM_SRC/buildtools/linux64/gn"
           test -x "$DEPOT_TOOLS/autoninja"
 
-          "$CHROMIUM_SRC/buildtools/linux64/gn" --version
-          df -h /
-
-      - name: Configure Cronet Linux x64
+      - name: Configure Linux x64 Cronet with GN
         shell: bash
         run: |
           set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           cd "$CHROMIUM_SRC"
 
           rm -rf "$OUT_DIR"
           mkdir -p "$OUT_DIR"
 
-          # PGO profiles are not checked out by the default Chromium checkout.
-          # Disable PGO so GN does not require chrome/build/pgo_profiles/*.profdata.
+          # Current Chromium's root graph does not necessarily make the
+          # components/cronet target reachable by default. root_extra_deps
+          # explicitly adds the exact Cronet shared-library target to the GN
+          # graph without building Chrome itself.
           cat > "$OUT_DIR/args.gn" <<'EOF_GN'
           target_cpu = "x64"
           current_cpu = "x64"
+
           is_debug = false
           is_component_build = false
           is_official_build = false
+
+          # Disable Chrome's PGO profile lookup because --no-history does not
+          # checkout the optional profile files.
           chrome_pgo_phase = 0
-          dcheck_always_on = false
+
+          # Make the native desktop Cronet target reachable from the root graph.
+          root_extra_deps = [ "//components/cronet:cronet" ]
+
           symbol_level = 0
           blink_symbol_level = 0
           v8_symbol_level = 0
+
+          dcheck_always_on = false
+          enable_nacl = false
           use_goma = false
           use_remoteexec = false
-          enable_nacl = false
           EOF_GN
 
-          # Remove indentation introduced by the YAML heredoc.
-          sed -i 's/^          //' "$OUT_DIR/args.gn"
+          sed -i 's/^[[:space:]]\{10\}//' "$OUT_DIR/args.gn"
 
+          GN="$CHROMIUM_SRC/buildtools/linux64/gn"
+          test -x "$GN"
+
+          echo '=== args.gn ==='
           cat "$OUT_DIR/args.gn"
-          "$CHROMIUM_SRC/buildtools/linux64/gn" gen "$OUT_DIR"
 
-          echo '=== Cronet targets ==='
-          "$CHROMIUM_SRC/buildtools/linux64/gn" ls "$OUT_DIR" | grep -E '(^|/)cronet(:cronet)?$|components/cronet' | head -100 || true
+          "$GN" gen "$OUT_DIR"
 
-      - name: Verify Cronet target and build shared library
+          echo '=== Cronet target lookup ==='
+          "$GN" desc "$OUT_DIR" //components/cronet:cronet
+
+      - name: Verify Cronet target is in the generated graph
         shell: bash
         run: |
           set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           cd "$CHROMIUM_SRC"
 
-          # GN/Ninja target syntax is relative to the output directory.
-          # Do NOT pass a leading // to autoninja; that becomes /components/cronet:cronet.
-          TARGET='components/cronet:cronet'
+          GN="$CHROMIUM_SRC/buildtools/linux64/gn"
 
-          if ! "$CHROMIUM_SRC/buildtools/linux64/gn" ls "$OUT_DIR" | grep -Fxq 'components/cronet:cronet'; then
-            echo 'ERROR: components/cronet:cronet is not present in the generated target graph.'
-            echo 'Available Cronet targets:'
-            "$CHROMIUM_SRC/buildtools/linux64/gn" ls "$OUT_DIR" | grep -i cronet | head -200 || true
-            exit 1
-          fi
+          "$GN" desc "$OUT_DIR" //components/cronet:cronet > /home/runner/cronet_target_desc.txt
 
-          autoninja -C "$OUT_DIR" "$TARGET"
+          echo '=== Cronet target ==='
+          cat /home/runner/cronet_target_desc.txt
 
-      - name: Collect and verify Cronet shared library
+          grep -q '^type = shared_library' /home/runner/cronet_target_desc.txt
+
+      - name: Build only Cronet shared library
         shell: bash
         run: |
           set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          export PATH="$DEPOT_TOOLS:$PATH"
+          cd "$CHROMIUM_SRC"
 
-          rm -rf /home/runner/cronet-artifact
+          # Do not prefix the target with // here. Ninja/Siso expects the
+          # target path as components/cronet:cronet.
+          autoninja -C "$OUT_DIR" components/cronet:cronet
+
+      - name: Locate and validate Cronet Linux x64 library
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$CHROMIUM_SRC"
+
           mkdir -p /home/runner/cronet-artifact
 
-          found=''
-          while IFS= read -r candidate; do
-            if [[ -n "$candidate" ]]; then
-              found="$candidate"
-              break
-            fi
-          done < <(find "$OUT_DIR" -type f \( -name 'libcronet*.so' -o -name 'cronet*.so' \) -print | sort)
+          found="$(find "$OUT_DIR" -type f \( -name 'libcronet.so' -o -name 'libcronet.*.so' -o -name 'cronet.*.so' \) -print | head -n 1 || true)"
 
           if [[ -z "$found" ]]; then
-            echo 'ERROR: no Cronet shared library was produced.'
-            echo 'Shared libraries found under output directory:'
-            find "$OUT_DIR" -type f -name '*.so*' -print | sort | head -300 || true
+            echo 'ERROR: No Cronet shared library was produced.'
+            echo 'All shared libraries under the output directory:'
+            find "$OUT_DIR" -type f -name '*.so' -print | head -200 || true
             exit 1
           fi
 
@@ -217,31 +229,36 @@ jobs:
           file /home/runner/cronet-artifact/libcronet.so
           readelf -h /home/runner/cronet-artifact/libcronet.so
 
-          if ! file /home/runner/cronet-artifact/libcronet.so | grep -Eq 'ELF 64-bit.*x86-64'; then
-            echo 'ERROR: the produced library is not a Linux x86-64 ELF shared object.'
-            exit 1
-          fi
+          file /home/runner/cronet-artifact/libcronet.so | grep -Eq 'ELF 64-bit.*x86-64'
 
-          sha256sum /home/runner/cronet-artifact/libcronet.so | tee /home/runner/cronet-artifact/SHA256SUMS.txt
+          sha256sum /home/runner/cronet-artifact/libcronet.so \
+            | tee /home/runner/cronet-artifact/SHA256SUMS.txt
 
           {
-            printf 'Chromium revision: '
-            git -C "$CHROMIUM_SRC" rev-parse HEAD
-            printf 'Chromium version: '
-            tr '\n' ' ' < "$CHROMIUM_SRC/chrome/VERSION"
-            printf '\n'
-            printf 'Runner: ubuntu-latest\n'
-            printf 'Architecture: x86_64\n'
-            printf 'GN target: components/cronet:cronet\n'
-            printf 'Original library: %s\n' "$found"
-            printf 'Output library: libcronet.so\n'
+            echo "Chromium revision: $(git -C "$CHROMIUM_SRC" rev-parse HEAD)"
+            echo "Chromium version: $(tr '\n' ' ' < "$CHROMIUM_SRC/chrome/VERSION")"
+            echo "Runner: ubuntu-latest"
+            echo "Architecture: x86_64"
+            echo "GN target: //components/cronet:cronet"
+            echo "Source library: $found"
           } > /home/runner/cronet-artifact/build-info.txt
 
-      - name: Upload Cronet library
+      - name: Upload Cronet artifact
         uses: actions/upload-artifact@v4
         with:
           name: cronet-linux-x64-latest
           path: /home/runner/cronet-artifact
           if-no-files-found: error
           compression-level: 0
+          retention-days: 7
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: cronet-linux-x64-build-metadata
+          path: |
+            /home/runner/chromium_revision.txt
+            /home/runner/chromium_version.txt
+            /home/runner/cronet_target_desc.txt
+          if-no-files-found: warn
           retention-days: 7
