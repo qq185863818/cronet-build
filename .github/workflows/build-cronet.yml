@@ -155,9 +155,7 @@ jobs:
           v8_symbol_level = 0
 
           dcheck_always_on = false
-          use_goma = false
-          use_remoteexec = false
-          EOF_GN
+                              EOF_GN
 
           sed -i 's/^[[:space:]]\{10\}//' "$OUT_DIR/args.gn"
 
@@ -168,10 +166,6 @@ jobs:
           cat "$OUT_DIR/args.gn"
 
           "$GN" gen "$OUT_DIR"
-
-          echo '=== Cronet target lookup ==='
-          "$GN" desc "$OUT_DIR" //components/cronet:cronet
-
       - name: Verify Cronet target is in the generated graph
         shell: bash
         run: |
