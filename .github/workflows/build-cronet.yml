@@ -8,6 +8,14 @@ on:
 permissions:
   contents: read
 
+env:
+  DEPOT_TOOLS: /home/runner/depot_tools
+  CHROMIUM_ROOT: /home/runner/chromium
+  CHROMIUM_SRC: /home/runner/chromium/src
+  OUT_DIR: /home/runner/chromium/src/out/Cronet
+  GIT_TERMINAL_PROMPT: '0'
+  DEPOT_TOOLS_UPDATE: '1'
+
 jobs:
   linux-x64:
     name: Linux x64 Cronet
@@ -19,103 +27,92 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          echo '=== OS ==='
           uname -a
-          cat /etc/os-release
-          echo '=== CPU ==='
           arch
           nproc
-          echo '=== MEMORY ==='
           free -h
-          echo '=== DISK ==='
-          df -h / /home/runner
+          df -h /
 
-      - name: Free safe-to-remove runner data
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          # Only remove large caches/artifacts that are not needed by Chromium.
-          rm -rf "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
-          rm -rf ~/.cache/pip 2>/dev/null || true
-          rm -rf ~/.cache/ccache 2>/dev/null || true
-          rm -rf ~/.npm 2>/dev/null || true
-          rm -rf ~/.cargo/registry ~/.cargo/git 2>/dev/null || true
-          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/* 2>/dev/null || true
-          sudo apt-get clean || true
-          docker system prune -af --volumes 2>/dev/null || true
-
-          echo '=== DISK AFTER CLEANUP ==='
-          df -h / /home/runner
-
-      - name: Install minimal host prerequisites
+      - name: Install required host packages
         shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
+            build-essential \
             ca-certificates \
             curl \
             file \
             git \
             git-lfs \
+            lsb-release \
+            ninja-build \
+            pkg-config \
+            python3 \
             rsync \
             unzip \
             zip
 
-      - name: Install latest depot_tools
+      - name: Install latest depot_tools and bootstrap it
         shell: bash
         run: |
           set -euxo pipefail
 
-          rm -rf /home/runner/depot_tools
+          rm -rf "$DEPOT_TOOLS"
           git clone --depth=1 \
             https://chromium.googlesource.com/chromium/tools/depot_tools.git \
-            /home/runner/depot_tools
+            "$DEPOT_TOOLS"
 
-          export PATH="/home/runner/depot_tools:$PATH"
+          cd "$DEPOT_TOOLS"
 
+          # IMPORTANT:
+          # A fresh depot_tools checkout is not bootstrapped yet. The current
+          # depot_tools wrappers require python3_bin_reldir.txt, which is
+          # created by ensure_bootstrap/update_depot_tools.
+          ./ensure_bootstrap
+
+          test -f "$DEPOT_TOOLS/python3_bin_reldir.txt"
+
+          export PATH="$DEPOT_TOOLS:$PATH"
           command -v gclient
           command -v fetch
+          command -v gn
           command -v autoninja
-
-          echo "depot_tools revision:"
-          git -C /home/runner/depot_tools rev-parse HEAD
+          python3 --version
+          gclient --version || true
 
       - name: Checkout latest Chromium main without Git history
         shell: bash
         run: |
           set -euxo pipefail
+          export PATH="$DEPOT_TOOLS:$PATH"
 
-          export PATH="/home/runner/depot_tools:$PATH"
+          rm -rf "$CHROMIUM_ROOT"
+          mkdir -p "$CHROMIUM_ROOT"
+          cd "$CHROMIUM_ROOT"
 
-          rm -rf /home/runner/chromium
-          mkdir -p /home/runner/chromium
-          cd /home/runner/chromium
-
-          # Chromium's official checkout command for a fresh tree without full history.
+          # Always use the current Chromium main branch. No historical Git data.
           fetch --nohooks --no-history chromium
 
-          cd /home/runner/chromium/src
+          cd "$CHROMIUM_SRC"
 
           echo '=== Chromium revision ==='
           git rev-parse HEAD | tee /home/runner/chromium_revision.txt
 
           echo '=== Chromium version ==='
-          tr '\n' ' ' < chrome/VERSION | tee /home/runner/chromium_version.txt
-          echo
+          cat chrome/VERSION | tee /home/runner/chromium_version.txt
 
-          echo '=== DISK AFTER CHECKOUT ==='
-          df -h / /home/runner
+          echo '=== Disk usage after checkout ==='
+          df -h /
 
-      - name: Install Chromium build dependencies from checked-out source
+      - name: Install Chromium build dependencies
         shell: bash
         run: |
           set -euxo pipefail
-          cd /home/runner/chromium/src
+          cd "$CHROMIUM_SRC"
 
-          # Chromium maintains this dependency installer in the source tree.
-          # Do not add obsolete Ubuntu packages such as python3-distutils here.
+          # Use Chromium's own dependency installer so the package list tracks
+          # the current Chromium source instead of a stale hand-maintained list.
           sudo ./build/install-build-deps.sh \
             --no-prompt \
             --no-chromeos-fonts \
@@ -125,145 +122,135 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          export PATH="$DEPOT_TOOLS:$PATH"
+          cd "$CHROMIUM_SRC"
 
-          export PATH="/home/runner/depot_tools:$PATH"
-          cd /home/runner/chromium/src
-
-          # Fetch/update all DEPS dependencies and bootstrap Chromium build tools.
-          gclient sync -D --force --reset --no-history
+          # Hooks download the current build tools and other DEPS-managed data.
           gclient runhooks
 
-          echo '=== Verify generated GN tool ==='
-          test -x buildtools/linux64/gn
-          buildtools/linux64/gn --version
-
-          echo '=== DISK AFTER HOOKS ==='
-          df -h / /home/runner
+          echo '=== Disk usage after hooks ==='
+          df -h /
 
       - name: Configure Cronet Linux x64
         shell: bash
         run: |
           set -euxo pipefail
-
-          cd /home/runner/chromium/src
-
-          OUT_DIR=/home/runner/chromium/src/out/Cronet
-          GN=/home/runner/chromium/src/buildtools/linux64/gn
+          cd "$CHROMIUM_SRC"
 
           rm -rf "$OUT_DIR"
           mkdir -p "$OUT_DIR"
 
-          # Write a real args.gn file instead of using a shell multi-line --args
-          # value. This also explicitly disables Chromium PGO, which otherwise
-          # tries to locate a Linux .profdata file that is not present in a normal
-          # --no-history checkout.
-          cat > "$OUT_DIR/args.gn" <<'EOF'
-          # Linux x86-64 desktop Cronet build.
-          target_cpu = "x64"
-          current_cpu = "x64"
-
-          # Optimized release-style build without Chrome's official PGO profile dependency.
-          is_debug = false
-          is_component_build = false
-          is_official_build = false
-          chrome_pgo_phase = 0
-
-          # Keep the artifact small and avoid unnecessary debug symbol output.
-          symbol_level = 0
-          blink_symbol_level = 0
-          v8_symbol_level = 0
-
-          # Disable distributed build systems that are unavailable on a standard runner.
-          use_goma = false
-          use_remoteexec = false
-
-          enable_nacl = false
-          dcheck_always_on = false
-          EOF
+          # Write args.gn directly. Avoid shell/YAML heredoc escaping issues.
+          printf '%s\n' \
+            '# Latest Chromium desktop Cronet, Linux x86-64.' \
+            'target_cpu = "x64"' \
+            'current_cpu = "x64"' \
+            'is_debug = false' \
+            'is_component_build = false' \
+            '' \
+            '# Disable PGO because the free runner does not prefetch Chrome PGO profiles.' \
+            'chrome_pgo_phase = 0' \
+            '' \
+            'symbol_level = 0' \
+            'blink_symbol_level = 0' \
+            'v8_symbol_level = 0' \
+            'dcheck_always_on = false' \
+            'use_goma = false' \
+            'use_remoteexec = false' \
+            'enable_nacl = false' \
+            > "$OUT_DIR/args.gn"
 
           echo '=== args.gn ==='
           cat "$OUT_DIR/args.gn"
 
+          GN="$CHROMIUM_SRC/buildtools/linux64/gn"
+          test -x "$GN"
           "$GN" gen "$OUT_DIR"
 
-          echo '=== GN configuration summary ==='
-          "$GN" args "$OUT_DIR" --list | grep -E \
-            '^(target_cpu|current_cpu|is_debug|is_component_build|is_official_build|chrome_pgo_phase|symbol_level|blink_symbol_level|v8_symbol_level|use_goma|use_remoteexec|enable_nacl|dcheck_always_on)' \
-            || true
+          echo '=== GN args ==='
+          "$GN" args "$OUT_DIR" --list > /home/runner/gn_args.txt
 
-      - name: Build only Cronet native shared library
+      - name: Build Cronet shared library
         shell: bash
         run: |
           set -euxo pipefail
+          export PATH="$DEPOT_TOOLS:$PATH"
+          cd "$CHROMIUM_SRC"
 
-          export PATH="/home/runner/depot_tools:$PATH"
-          cd /home/runner/chromium/src
-
-          OUT_DIR=/home/runner/chromium/src/out/Cronet
-
-          # Current Chromium defines //components/cronet:cronet as a native
-          # shared_library on non-Android/non-iOS platforms.
+          # Only build the native Linux Cronet shared-library target.
           autoninja -C "$OUT_DIR" //components/cronet:cronet
 
-      - name: Locate and verify Cronet .so
+      - name: Collect and verify libcronet.so
         shell: bash
         run: |
           set -euxo pipefail
+          cd "$CHROMIUM_SRC"
 
-          cd /home/runner/chromium/src
-          OUT_DIR=/home/runner/chromium/src/out/Cronet
-          ARTIFACT_DIR=/home/runner/cronet-artifact
+          mkdir -p /home/runner/cronet-artifact
 
-          rm -rf "$ARTIFACT_DIR"
-          mkdir -p "$ARTIFACT_DIR"
+          found=''
+          while IFS= read -r f; do
+            found="$f"
+            break
+          done < <(
+            find "$OUT_DIR" -type f \
+              \( -name 'libcronet*.so' -o -name 'cronet*.so' \) \
+              -print | sort
+          )
 
-          # Cronet output may be versioned, e.g. libcronet.<version>.so.
-          # Find the actual file produced by GN/Ninja and normalize its artifact name.
-          found="$(find "$OUT_DIR" -type f \( -name 'libcronet*.so' -o -name 'libcronet*.so.*' \) -print | head -n 1)"
-
-          if [ -z "$found" ]; then
-            echo 'ERROR: no Cronet shared library was produced.'
-            echo 'Available shared libraries:'
-            find "$OUT_DIR" -type f -name '*.so*' -print | head -200 || true
+          if [[ -z "$found" ]]; then
+            echo 'ERROR: Cronet shared library was not produced.'
+            echo '=== Existing shared libraries ==='
+            find "$OUT_DIR" -type f -name '*.so*' -print | sort | head -200 || true
             exit 1
           fi
 
           echo "Found: $found"
-          cp -L "$found" "$ARTIFACT_DIR/libcronet.so"
+          cp -L "$found" /home/runner/cronet-artifact/libcronet.so
 
           echo '=== file ==='
-          file "$ARTIFACT_DIR/libcronet.so"
+          file /home/runner/cronet-artifact/libcronet.so
 
           echo '=== ELF header ==='
-          readelf -h "$ARTIFACT_DIR/libcronet.so"
+          readelf -h /home/runner/cronet-artifact/libcronet.so
 
           echo '=== Architecture check ==='
-          file "$ARTIFACT_DIR/libcronet.so" | grep -E 'ELF 64-bit.*x86-64'
+          machine="$(readelf -h /home/runner/cronet-artifact/libcronet.so | awk -F: '/Machine:/ {gsub(/^ +| +$/, "", $2); print $2}')"
+          if [[ "$machine" != 'Advanced Micro Devices X86-64' ]]; then
+            echo "ERROR: Expected x86-64, got: $machine"
+            exit 1
+          fi
 
           echo '=== SHA256 ==='
-          sha256sum "$ARTIFACT_DIR/libcronet.so" | tee "$ARTIFACT_DIR/SHA256SUMS.txt"
+          sha256sum /home/runner/cronet-artifact/libcronet.so | tee /home/runner/cronet-artifact/SHA256SUMS.txt
 
-          cat > "$ARTIFACT_DIR/build-info.txt" <<EOF
-          Chromium revision: $(git -C /home/runner/chromium/src rev-parse HEAD)
-          Chromium version: $(tr '\n' ' ' < /home/runner/chromium/src/chrome/VERSION)
-          depot_tools revision: $(git -C /home/runner/depot_tools rev-parse HEAD)
-          Runner: ubuntu-latest
-          Host architecture: $(uname -m)
-          Target architecture: x86_64
-          GN output directory: $OUT_DIR
-          GN target: //components/cronet:cronet
-          Original Cronet library: $found
-          Artifact: libcronet.so
-          EOF
+          printf '%s\n' \
+            "Chromium revision: $(git rev-parse HEAD)" \
+            "Chromium version: $(tr '\n' ' ' < chrome/VERSION)" \
+            'Runner: ubuntu-latest' \
+            'Architecture: x86_64' \
+            'GN target: //components/cronet:cronet' \
+            "Original shared library: $found" \
+            'Packaged shared library: libcronet.so' \
+            'PGO: disabled (chrome_pgo_phase = 0)' \
+            > /home/runner/cronet-artifact/build-info.txt\n\n          cat /home/runner/cronet-artifact/build-info.txt
 
-          echo '=== Build info ==='
-          cat "$ARTIFACT_DIR/build-info.txt"
-
-      - name: Upload Cronet Linux x64 library
+      - name: Upload Cronet artifact
         uses: actions/upload-artifact@v4
         with:
           name: cronet-linux-x64-latest
           path: /home/runner/cronet-artifact
           if-no-files-found: error
           compression-level: 0
+          retention-days: 7
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: cronet-linux-x64-build-metadata
+          path: |
+            /home/runner/chromium_revision.txt
+            /home/runner/chromium_version.txt
+            /home/runner/gn_args.txt
+          if-no-files-found: warn
           retention-days: 7
