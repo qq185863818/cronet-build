@@ -160,6 +160,7 @@ jobs:
             > "$OUT_DIR/args.gn"
 
           sed -i '/^group("chromium_builder_perf") {/a\  data_deps = []' "$CHROMIUM_SRC/BUILD.gn"
+          sed -i '/^target(_test_target_type, "net_unittests") {/a\  configs = []' "$CHROMIUM_SRC/net/BUILD.gn"
 
           GN="$CHROMIUM_SRC/buildtools/linux64/gn"
           test -x "$GN"
