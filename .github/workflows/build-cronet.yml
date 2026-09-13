@@ -145,7 +145,6 @@ jobs:
           is_debug = false
           is_component_build = false
           is_official_build = true
-          is_cronet_build = true
 
           # Disable Chrome's PGO profile lookup because --no-history does not
           # checkout the optional profile files.
