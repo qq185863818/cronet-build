@@ -179,6 +179,19 @@ jobs:
                   '  public_deps = [ "//components/metrics:library_support" ]\n',
                   "Cronet Android JNI dependency",
               )
+              replace_once(
+                  'group("cronet_package") {\n'
+                  '  testonly = true\n'
+                  '  deps = [ "//components/cronet/android:cronet_package_android" ]\n'
+                  '}\n',
+                  'if (is_android) {\n'
+                  '  group("cronet_package") {\n'
+                  '    testonly = true\n'
+                  '    deps = [ "//components/cronet/android:cronet_package_android" ]\n'
+                  '  }\n'
+                  '}\n',
+                  "Android Cronet package group",
+              )
 
               text = text.rstrip() + '''
 
