@@ -1,4 +1,4 @@
-name: Build Latest Chromium Cronet Linux x64
+name: Build cronet-go Chromium Fork Linux x64
 
 on:
   workflow_dispatch:
@@ -11,14 +11,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DEPOT_TOOLS: /home/runner/depot_tools
-  CHROMIUM_ROOT: /home/runner/chromium
-  CHROMIUM_SRC: /home/runner/chromium/src
-  OUT_DIR: /home/runner/chromium/src/out/Cronet
+  CRONET_GO_ROOT: /home/runner/cronet-go
+  NAIVE_ROOT: /home/runner/cronet-go/naiveproxy
+  CHROMIUM_SRC: /home/runner/cronet-go/naiveproxy/src
+  OUT_DIR: /home/runner/cronet-go/naiveproxy/src/out/cronet-linux-x64
 
 jobs:
   linux-x64:
-    name: Build Chromium Cronet Linux x64
+    name: Build cronet-go Chromium Fork Linux x64
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
@@ -48,6 +48,7 @@ jobs:
             git \
             git-lfs \
             lsb-release \
+            ccache \
             ninja-build \
             pkg-config \
             python3 \
@@ -55,129 +56,52 @@ jobs:
             unzip \
             zip
 
-      - name: Install latest depot_tools and bootstrap
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Checkout cronet-go and its Chromium fork
         shell: bash
         run: |
           set -euxo pipefail
 
-          rm -rf "$DEPOT_TOOLS"
-          git clone --depth=1 \
-            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
-            "$DEPOT_TOOLS"
+          rm -rf "$CRONET_GO_ROOT"
+          git clone --recursive --depth=1 \
+            https://github.com/SagerNet/cronet-go.git \
+            "$CRONET_GO_ROOT"
 
-          export PATH="$DEPOT_TOOLS:$PATH"
+          test -f "$CRONET_GO_ROOT/go.mod"
+          test -f "$NAIVE_ROOT/CHROMIUM_VERSION"
+          test -f "$CHROMIUM_SRC/components/cronet/BUILD.gn"
+          grep -Fq 'static_library("cronet_static")' \
+            "$CHROMIUM_SRC/components/cronet/BUILD.gn"
+          grep -Fq 'shared_library("cronet")' \
+            "$CHROMIUM_SRC/components/cronet/BUILD.gn"
 
-          cd "$DEPOT_TOOLS"
-          ./ensure_bootstrap
-
-          test -f "$DEPOT_TOOLS/python3_bin_reldir.txt"
-
-          command -v gclient
-          command -v fetch
-          command -v autoninja
-
-          gclient --version || true
-
-      - name: Install Chromium build dependencies
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          rm -rf /tmp/chromium-deps
-          git clone --depth=1 \
-            https://chromium.googlesource.com/chromium/src.git \
-            /tmp/chromium-deps
-
-          cd /tmp/chromium-deps
-
-          sudo ./build/install-build-deps.sh \
-            --no-prompt \
-            --no-chromeos-fonts \
-            --no-nacl
-
-          rm -rf /tmp/chromium-deps
-
-      - name: Checkout latest Chromium main without Git history
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-
-          rm -rf "$CHROMIUM_ROOT"
-          mkdir -p "$CHROMIUM_ROOT"
-          cd "$CHROMIUM_ROOT"
-
-          fetch --nohooks --no-history chromium
-
-          cd "$CHROMIUM_SRC"
-          echo "Chromium revision:"
-          git rev-parse HEAD | tee /home/runner/chromium_revision.txt
+          git -C "$CRONET_GO_ROOT" rev-parse HEAD \
+            | tee /home/runner/cronet_go_revision.txt
+          git -C "$NAIVE_ROOT" rev-parse HEAD \
+            | tee /home/runner/naiveproxy_revision.txt
 
           echo "Chromium version:"
-          cat chrome/VERSION | tee /home/runner/chromium_version.txt
+          cat "$NAIVE_ROOT/CHROMIUM_VERSION" \
+            | tee /home/runner/chromium_version.txt
 
-      - name: Sync dependencies and run hooks
+      - name: Prepare Chromium fork toolchain
         shell: bash
         run: |
           set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$CHROMIUM_SRC"
+          rm -f "$CHROMIUM_SRC/build/linux/sysroot_scripts/keyring.gpg"
+          GPG_TTY=/dev/null \
+            "$CHROMIUM_SRC/build/linux/sysroot_scripts/generate_keyring.sh"
 
-          gclient sync -D --force --reset --no-history
-          gclient runhooks
-
-          test -x "$CHROMIUM_SRC/buildtools/linux64/gn"
-          test -x "$DEPOT_TOOLS/autoninja"
-
-      - name: Configure Linux x64 Cronet with GN
+      - name: Build Linux x64 Cronet static and shared libraries
         shell: bash
         run: |
           set -euxo pipefail
-          cd "$CHROMIUM_SRC"
-
-          rm -rf "$OUT_DIR"
-          mkdir -p "$OUT_DIR"
-
-          printf '%s\n' \
-            'target_cpu = "x64"' \
-            'current_cpu = "x64"' \
-            '' \
-            'is_debug = false' \
-            'is_component_build = false' \
-            'is_official_build = false' \
-            'is_cronet_build = true' \
-            'use_platform_icu_alternatives = false' \
-            '' \
-            '# Disable Chrome'"'"'s PGO profile lookup because --no-history does not' \
-            '# checkout the optional profile files.' \
-            'chrome_pgo_phase = 0' \
-            '' \
-            'symbol_level = 0' \
-            'blink_symbol_level = 0' \
-            'v8_symbol_level = 0' \
-            '' \
-            'dcheck_always_on = false' \
-            > "$OUT_DIR/args.gn"
-
-          sed -i '/^group("chromium_builder_perf") {/a\  data_deps = []' "$CHROMIUM_SRC/BUILD.gn"
-          sed -i 's/^if (is_cronet_build) {$/if (is_cronet_build \&\& is_android) {/' "$CHROMIUM_SRC/net/BUILD.gn"
-
-          GN="$CHROMIUM_SRC/buildtools/linux64/gn"
-          test -x "$GN"
-
-          echo '=== args.gn ==='
-          cat "$OUT_DIR/args.gn"
-
-          "$GN" gen "$OUT_DIR"
-      - name: Build only Cronet shared library
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$CHROMIUM_SRC"
-
-          # Match the local successful build command.
-          autoninja -C "$OUT_DIR" cronet
+          cd "$CRONET_GO_ROOT"
+          go run ./cmd/build-naive --target=linux/amd64 build
 
       - name: Locate and validate Cronet Linux x64 library
         shell: bash
@@ -208,9 +132,10 @@ jobs:
             | tee /home/runner/cronet-artifact/SHA256SUMS.txt
 
           {
-            echo "Chromium revision: $(git -C "$CHROMIUM_SRC" rev-parse HEAD)"
-            echo "Chromium version: $(tr '\n' ' ' < "$CHROMIUM_SRC/chrome/VERSION")"
-            echo "Runner: ubuntu-latest"
+            echo "cronet-go revision: $(git -C "$CRONET_GO_ROOT" rev-parse HEAD)"
+            echo "naiveproxy revision: $(git -C "$NAIVE_ROOT" rev-parse HEAD)"
+            echo "Chromium version: $(tr '\n' ' ' < "$NAIVE_ROOT/CHROMIUM_VERSION")"
+            echo "Runner: ubuntu-22.04"
             echo "Architecture: x86_64"
             echo "GN target: //components/cronet:cronet"
             echo "Source library: $found"
@@ -230,8 +155,8 @@ jobs:
         with:
           name: cronet-linux-x64-build-metadata
           path: |
-            /home/runner/chromium_revision.txt
+            /home/runner/cronet_go_revision.txt
+            /home/runner/naiveproxy_revision.txt
             /home/runner/chromium_version.txt
-            /home/runner/cronet_target_desc.txt
           if-no-files-found: warn
           retention-days: 7
