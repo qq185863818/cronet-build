@@ -220,6 +220,23 @@ jobs:
                   '',
                   "Cronet request JNI audit call",
               )
+              replace_request_once(
+                  '  if (traffic_stats_tag_set_ || traffic_stats_uid_set_) {\n'
+                  '    url_request_->set_socket_tag(net::SocketTag(\n'
+                  '        traffic_stats_uid_set_ ? traffic_stats_uid_ : net::SocketTag::UNSET_UID,\n'
+                  '        traffic_stats_tag_set_ ? traffic_stats_tag_\n'
+                  '                               : net::SocketTag::UNSET_TAG));\n'
+                  '  }\n',
+                  '#if BUILDFLAG(IS_ANDROID)\n'
+                  '  if (traffic_stats_tag_set_ || traffic_stats_uid_set_) {\n'
+                  '    url_request_->set_socket_tag(net::SocketTag(\n'
+                  '        traffic_stats_uid_set_ ? traffic_stats_uid_ : net::SocketTag::UNSET_UID,\n'
+                  '        traffic_stats_tag_set_ ? traffic_stats_tag_\n'
+                  '                               : net::SocketTag::UNSET_TAG));\n'
+                  '  }\n'
+                  '#endif\n',
+                  "Android socket tag setup",
+              )
               request_path.write_text(request_text)
 
               replace_once(
