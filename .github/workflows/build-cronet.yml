@@ -138,6 +138,7 @@ jobs:
           from pathlib import Path
 
           path = Path(sys.argv[1])
+          request_path = path.with_name("cronet_url_request.cc")
           text = path.read_text()
           marker = "# BEGIN linux cronet target"
 
@@ -179,6 +180,48 @@ jobs:
                   '  public_deps = [ "//components/metrics:library_support" ]\n',
                   "Cronet Android JNI dependency",
               )
+
+              request_text = request_path.read_text()
+
+              def replace_request_once(old, new, description):
+                  global request_text
+                  count = request_text.count(old)
+                  if count != 1:
+                      raise SystemExit(
+                          f"Expected one {description}, found {count}"
+                      )
+                  request_text = request_text.replace(old, new, 1)
+
+              replace_request_once(
+                  '#include "base/android/jni_android.h"\n'
+                  '#include "base/android/jni_string.h"\n',
+                  '',
+                  "Android JNI includes",
+              )
+              replace_request_once(
+                  '#include "components/cronet/android/cronet_jni_headers/CronetPccAuditLogger_jni.h"\n',
+                  '',
+                  "Cronet Android JNI audit header",
+              )
+              replace_request_once(
+                  '  {\n'
+                  '    JNIEnv* env = base::android::AttachCurrentThread();\n'
+                  '    cronet::Java_CronetPccAuditLogger_maybeWrite(env,\n'
+                  '                                                 redirect_info.new_url.spec());\n'
+                  '  }\n',
+                  '',
+                  "Cronet redirect JNI audit call",
+              )
+              replace_request_once(
+                  '  {\n'
+                  '    JNIEnv* env = base::android::AttachCurrentThread();\n'
+                  '    cronet::Java_CronetPccAuditLogger_maybeWrite(env, initial_url_.spec());\n'
+                  '  }\n',
+                  '',
+                  "Cronet request JNI audit call",
+              )
+              request_path.write_text(request_text)
+
               replace_once(
                   'group("cronet_package") {\n'
                   '  testonly = true\n'
