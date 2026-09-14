@@ -1,4 +1,4 @@
-name: Build Latest Chromium Cronet Linux x64
+name: Build Chromium Cronet Linux x64 150.0.7871.63
 
 on:
   workflow_dispatch:
@@ -7,10 +7,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-latest-cronet-linux-x64
+  group: build-cronet-linux-x64-150
   cancel-in-progress: true
 
 env:
+  CHROMIUM_VERSION: "150.0.7871.63"
+  NAIVEPROXY_REF: 72a06c9fca0e2d228588c7f3074bf7efff3ff686
   DEPOT_TOOLS: /home/runner/depot_tools
   CHROMIUM_ROOT: /home/runner/chromium
   CHROMIUM_SRC: /home/runner/chromium/src
@@ -18,24 +20,40 @@ env:
 
 jobs:
   linux-x64:
-    name: Build Chromium Cronet Linux x64
-    runs-on: ubuntu-latest
+    name: Build Cronet shared library
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
-      - name: Show runner information
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Check out the matching native API bridge
+        uses: actions/checkout@v4
+        with:
+          repository: SagerNet/naiveproxy
+          ref: 72a06c9fca0e2d228588c7f3074bf7efff3ff686
+          path: naiveproxy-ref
+          fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /CHROMIUM_VERSION
+            /src/components/cronet/BUILD.gn
+            /src/components/cronet/cronet_exports.lst
+            /src/components/cronet/native/**
+
+      - name: Verify the pinned bridge source
         shell: bash
         run: |
           set -euxo pipefail
-          uname -a
-          arch
-          nproc
-          free -h
-          df -h /
-          python3 --version
-          git --version
+          test "$(git -C naiveproxy-ref rev-parse HEAD)" = "$NAIVEPROXY_REF"
+          test "$(tr -d '\r\n' < naiveproxy-ref/CHROMIUM_VERSION)" = "$CHROMIUM_VERSION"
+          grep -Fq 'shared_library("cronet")' naiveproxy-ref/src/components/cronet/BUILD.gn
+          grep -Fq '"//components/cronet/native:cronet_native_impl"' naiveproxy-ref/src/components/cronet/BUILD.gn
+          test -f naiveproxy-ref/src/components/cronet/native/BUILD.gn
+          test -f naiveproxy-ref/src/components/cronet/cronet_exports.lst
 
-      - name: Install basic host packages
+      - name: Install host build packages
         shell: bash
         run: |
           set -euxo pipefail
@@ -43,10 +61,12 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             ca-certificates \
+            ccache \
             curl \
             file \
             git \
             git-lfs \
+            gnupg \
             lsb-release \
             ninja-build \
             pkg-config \
@@ -55,334 +75,227 @@ jobs:
             unzip \
             zip
 
-      - name: Install latest depot_tools and bootstrap
+      - name: Cache compiler outputs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: cronet-ccache-linux-x64-${{ env.CHROMIUM_VERSION }}-${{ env.NAIVEPROXY_REF }}
+          restore-keys: |
+            cronet-ccache-linux-x64-${{ env.CHROMIUM_VERSION }}-
+
+      - name: Install depot_tools
         shell: bash
         run: |
           set -euxo pipefail
-
-          rm -rf "$DEPOT_TOOLS"
           git clone --depth=1 \
             https://chromium.googlesource.com/chromium/tools/depot_tools.git \
             "$DEPOT_TOOLS"
-
-          export PATH="$DEPOT_TOOLS:$PATH"
-
           cd "$DEPOT_TOOLS"
           ./ensure_bootstrap
-
           test -f "$DEPOT_TOOLS/python3_bin_reldir.txt"
-
+          echo "$DEPOT_TOOLS" >> "$GITHUB_PATH"
+          export PATH="$DEPOT_TOOLS:$PATH"
           command -v gclient
-          command -v fetch
           command -v autoninja
 
-          gclient --version || true
+      - name: Sync the exact official Chromium version
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$CHROMIUM_ROOT"
+          cd "$CHROMIUM_ROOT"
+          gclient config https://chromium.googlesource.com/chromium/src.git
+          gclient sync \
+            --nohooks \
+            --no-history \
+            --revision="src@refs/tags/$CHROMIUM_VERSION"
+
+          actual_version="$(awk -F= '
+            $1 == "MAJOR" { major = $2 }
+            $1 == "MINOR" { minor = $2 }
+            $1 == "BUILD" { build = $2 }
+            $1 == "PATCH" { patch = $2 }
+            END { printf "%s.%s.%s.%s", major, minor, build, patch }
+          ' "$CHROMIUM_SRC/chrome/VERSION")"
+          test "$actual_version" = "$CHROMIUM_VERSION"
+          CHROMIUM_REVISION="$(git -C "$CHROMIUM_SRC" rev-parse HEAD)"
+          printf '%s\n' "$CHROMIUM_REVISION" | tee "$GITHUB_WORKSPACE/chromium_revision.txt"
+          echo "CHROMIUM_REVISION=$CHROMIUM_REVISION" >> "$GITHUB_ENV"
 
       - name: Install Chromium build dependencies
         shell: bash
         run: |
           set -euxo pipefail
-
-          rm -rf /tmp/chromium-deps
-          git clone --depth=1 \
-            https://chromium.googlesource.com/chromium/src.git \
-            /tmp/chromium-deps
-
-          cd /tmp/chromium-deps
-
+          cd "$CHROMIUM_SRC"
+          rm -f build/linux/sysroot_scripts/keyring.gpg
+          GPG_TTY=/dev/null build/linux/sysroot_scripts/generate_keyring.sh
           sudo ./build/install-build-deps.sh \
             --no-prompt \
             --no-chromeos-fonts \
             --no-nacl
 
-          rm -rf /tmp/chromium-deps
-
-      - name: Checkout latest Chromium main without Git history
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export PATH="$DEPOT_TOOLS:$PATH"
-
-          rm -rf "$CHROMIUM_ROOT"
-          mkdir -p "$CHROMIUM_ROOT"
-          cd "$CHROMIUM_ROOT"
-
-          fetch --nohooks --no-history chromium
-
-          cd "$CHROMIUM_SRC"
-          echo "Chromium revision:"
-          git rev-parse HEAD | tee /home/runner/chromium_revision.txt
-
-          echo "Chromium version:"
-          cat chrome/VERSION | tee /home/runner/chromium_version.txt
-
-      - name: Sync dependencies and run hooks
+      - name: Sync toolchains and run Chromium hooks
         shell: bash
         run: |
           set -euxo pipefail
           export PATH="$DEPOT_TOOLS:$PATH"
           cd "$CHROMIUM_SRC"
-
-          gclient sync -D --force --reset --no-history
           gclient runhooks
-
-          test -x "$CHROMIUM_SRC/buildtools/linux64/gn"
+          test -x buildtools/linux64/gn
           test -x "$DEPOT_TOOLS/autoninja"
 
-      - name: Patch Cronet BUILD.gn for Linux
+      - name: Add the Linux native bridge target
         shell: bash
         run: |
           set -euxo pipefail
-          python3 - "$CHROMIUM_SRC/components/cronet/BUILD.gn" <<'PY'
-          import sys
+          reference="$GITHUB_WORKSPACE/naiveproxy-ref/src/components/cronet"
+          destination="$CHROMIUM_SRC/components/cronet"
+
+          test ! -e "$destination/native"
+          cp -a "$reference/native" "$destination/native"
+          test ! -e "$destination/cronet_exports.lst"
+          cp "$reference/cronet_exports.lst" "$destination/cronet_exports.lst"
+          test -f "$destination/cronet_global_state_stubs.cc"
+
+          python3 - "$destination/BUILD.gn" <<'PY'
           from pathlib import Path
+          import sys
 
           path = Path(sys.argv[1])
-          request_path = path.with_name("cronet_url_request.cc")
-          text = path.read_text()
-          marker = "# BEGIN linux cronet target"
+          text = path.read_text(encoding="utf-8")
+          marker = 'import("//build/buildflag_header.gni")\n'
 
-          if marker not in text:
-              def replace_once(old, new, description):
-                  global text
-                  count = text.count(old)
-                  if count != 1:
-                      raise SystemExit(
-                          f"Expected one {description}, found {count}"
-                      )
-                  text = text.replace(old, new, 1)
+          if text.count(marker) != 1:
+              raise SystemExit("Unexpected upstream Cronet BUILD.gn layout")
+          if 'shared_library("cronet")' in text:
+              raise SystemExit("Cronet shared-library target already exists")
 
-              replace_once(
-                  'import("//build/config/android/rules.gni")\n',
-                  'if (is_android) {\n'
-                  '  import("//build/config/android/rules.gni")\n'
-                  '}\n',
-                  "Android rules import",
-              )
-              replace_once(
-                  'proto_java_library("request_context_config_java_proto") {\n'
-                  '  proto_path = "."\n'
-                  '  sources = [ "proto/request_context_config.proto" ]\n'
-                  '}\n',
-                  'if (is_android) {\n'
-                  '  proto_java_library("request_context_config_java_proto") {\n'
-                  '    proto_path = "."\n'
-                  '    sources = [ "proto/request_context_config.proto" ]\n'
-                  '  }\n'
-                  '}\n',
-                  "Android proto target",
-              )
-              replace_once(
-                  '  public_deps = [ "//components/metrics:library_support" ]\n',
-                  '  if (!is_android) {\n'
-                  '    deps -= [ "//components/cronet/android:cronet_jni_headers" ]\n'
-                  '  }\n\n'
-                  '  public_deps = [ "//components/metrics:library_support" ]\n',
-                  "Cronet Android JNI dependency",
-              )
+          text = text.replace(
+              marker,
+              marker + 'import("//build/config/c++/c++.gni")\n',
+              1,
+          )
+          text += '''
 
-              request_text = request_path.read_text()
-
-              def replace_request_once(old, new, description):
-                  global request_text
-                  count = request_text.count(old)
-                  if count != 1:
-                      raise SystemExit(
-                          f"Expected one {description}, found {count}"
-                      )
-                  request_text = request_text.replace(old, new, 1)
-
-              replace_request_once(
-                  '#include "base/android/jni_android.h"\n'
-                  '#include "base/android/jni_string.h"\n',
-                  '',
-                  "Android JNI includes",
-              )
-              replace_request_once(
-                  '#include "components/cronet/android/cronet_jni_headers/CronetPccAuditLogger_jni.h"\n',
-                  '',
-                  "Cronet Android JNI audit header",
-              )
-              replace_request_once(
-                  '  {\n'
-                  '    JNIEnv* env = base::android::AttachCurrentThread();\n'
-                  '    cronet::Java_CronetPccAuditLogger_maybeWrite(env,\n'
-                  '                                                 redirect_info.new_url.spec());\n'
-                  '  }\n',
-                  '',
-                  "Cronet redirect JNI audit call",
-              )
-              replace_request_once(
-                  '  {\n'
-                  '    JNIEnv* env = base::android::AttachCurrentThread();\n'
-                  '    cronet::Java_CronetPccAuditLogger_maybeWrite(env, initial_url_.spec());\n'
-                  '  }\n',
-                  '',
-                  "Cronet request JNI audit call",
-              )
-              replace_request_once(
-                  '  if (traffic_stats_tag_set_ || traffic_stats_uid_set_) {\n'
-                  '    url_request_->set_socket_tag(net::SocketTag(\n'
-                  '        traffic_stats_uid_set_ ? traffic_stats_uid_ : net::SocketTag::UNSET_UID,\n'
-                  '        traffic_stats_tag_set_ ? traffic_stats_tag_\n'
-                  '                               : net::SocketTag::UNSET_TAG));\n'
-                  '  }\n',
-                  '#if BUILDFLAG(IS_ANDROID)\n'
-                  '  if (traffic_stats_tag_set_ || traffic_stats_uid_set_) {\n'
-                  '    url_request_->set_socket_tag(net::SocketTag(\n'
-                  '        traffic_stats_uid_set_ ? traffic_stats_uid_ : net::SocketTag::UNSET_UID,\n'
-                  '        traffic_stats_tag_set_ ? traffic_stats_tag_\n'
-                  '                               : net::SocketTag::UNSET_TAG));\n'
-                  '  }\n'
-                  '#endif\n',
-                  "Android socket tag setup",
-              )
-              request_path.write_text(request_text)
-
-              replace_once(
-                  'group("cronet_package") {\n'
-                  '  testonly = true\n'
-                  '  deps = [ "//components/cronet/android:cronet_package_android" ]\n'
-                  '}\n',
-                  'if (is_android) {\n'
-                  '  group("cronet_package") {\n'
-                  '    testonly = true\n'
-                  '    deps = [ "//components/cronet/android:cronet_package_android" ]\n'
-                  '  }\n'
-                  '}\n',
-                  "Android Cronet package group",
-              )
-
-              text = text.rstrip() + '''
-
-          # BEGIN linux cronet target
+          # Linux C API bridge from the pinned native source; Cronet core stays upstream.
           if (is_linux) {
-            static_library("cronet_static") {
+            shared_library("cronet") {
               deps = [
-                ":cronet_common",
                 "//base",
+                "//components/cronet:cronet_common",
+                "//components/cronet/native:cronet_native_impl",
+                "//components/grpc_support",
                 "//net",
               ]
-              sources = [ "cronet_global_state_stubs.cc" ]
-              complete_static_lib = true
-              configs += [ "//build/config/compiler:no_exit_time_destructors" ]
-              configs -= [ "//build/config/compiler:thin_archive" ]
-            }
 
-            shared_library("cronet") {
-              deps = [ ":cronet_static" ]
+              if (use_custom_libcxx) {
+                deps += [ "//build/config:shared_library_deps" ]
+              }
+
+              sources = [ "cronet_global_state_stubs.cc" ]
+              inputs = [ "cronet_exports.lst" ]
+              ldflags = [
+                "-Wl,--version-script=" + rebase_path("cronet_exports.lst"),
+              ]
             }
           }
-          # END linux cronet target
           '''
-              path.write_text(text)
-
-          if marker not in path.read_text():
-              raise SystemExit("Cronet BUILD.gn patch was not applied")
-          print(f"Patched {path}")
+          path.write_text(text, encoding="utf-8")
           PY
 
-      - name: Configure Linux x64 Cronet with GN
+      - name: Generate the Linux x64 Cronet build
         shell: bash
         run: |
           set -euxo pipefail
-          cd "$CHROMIUM_SRC"
-
-          rm -rf "$OUT_DIR"
           mkdir -p "$OUT_DIR"
-
-          printf '%s\n' \
-            'target_cpu = "x64"' \
-            'current_cpu = "x64"' \
-            '' \
-            'is_debug = false' \
-            'is_component_build = false' \
-            'is_official_build = false' \
-            'is_cronet_build = false' \
-            'root_extra_deps = [ "//components/cronet:cronet" ]' \
-            'use_platform_icu_alternatives = false' \
-            '' \
-            '# Disable Chrome'"'"'s PGO profile lookup because --no-history does not' \
-            '# checkout the optional profile files.' \
-            'chrome_pgo_phase = 0' \
-            '' \
-            'symbol_level = 0' \
-            'blink_symbol_level = 0' \
-            'v8_symbol_level = 0' \
-            '' \
-            'dcheck_always_on = false' \
-            > "$OUT_DIR/args.gn"
+          cat > "$OUT_DIR/args.gn" <<'EOF'
+          target_os = "linux"
+          target_cpu = "x64"
+          is_debug = false
+          is_component_build = false
+          is_official_build = true
+          is_clang = true
+          is_cronet_build = true
+          use_clang_modules = false
+          cc_wrapper = "ccache"
+          use_thin_lto = false
+          use_sysroot = true
+          chrome_pgo_phase = 0
+          symbol_level = 0
+          blink_symbol_level = 0
+          v8_symbol_level = 0
+          dcheck_always_on = false
+          fatal_linker_warnings = false
+          treat_warnings_as_errors = false
+          is_cfi = false
+          use_cfi_icall = false
+          optimize_for_size = true
+          EOF
 
           GN="$CHROMIUM_SRC/buildtools/linux64/gn"
-          test -x "$GN"
-
-          echo '=== args.gn ==='
-          cat "$OUT_DIR/args.gn"
-
           "$GN" gen "$OUT_DIR"
-      - name: Build only Cronet shared library
+          test "$("$GN" desc "$OUT_DIR" //components/cronet:cronet type)" = "shared_library"
+
+      - name: Build Cronet shared library
         shell: bash
         run: |
           set -euxo pipefail
           export PATH="$DEPOT_TOOLS:$PATH"
-          cd "$CHROMIUM_SRC"
+          ccache -M 5G
+          ccache -z
+          autoninja -C "$OUT_DIR" //components/cronet:cronet
+          ccache -s
 
-          # Match the local successful build command.
-          autoninja -C "$OUT_DIR" cronet
-
-      - name: Locate and validate Cronet Linux x64 library
+      - name: Validate and stage libcronet.so
         shell: bash
         run: |
           set -euxo pipefail
-          cd "$CHROMIUM_SRC"
+          source_library="$OUT_DIR/libcronet.so"
+          output_library="$GITHUB_WORKSPACE/libcronet.so"
+          test -s "$source_library"
+          cp -L "$source_library" "$output_library"
 
-          mkdir -p /home/runner/cronet-artifact
+          file "$output_library" | tee "$GITHUB_WORKSPACE/library-file.txt"
+          file "$output_library" | grep -Eq 'ELF 64-bit.*x86-64'
+          readelf -h "$output_library"
+          nm -D --defined-only "$output_library" \
+            | awk '{ print $NF }' \
+            | grep -Fxq Cronet_Engine_Create
 
-          found="$(find "$OUT_DIR" -type f \( -name 'libcronet.so' -o -name 'libcronet.*.so' -o -name 'cronet.*.so' \) -print | head -n 1 || true)"
+          python3 - "$output_library" <<'PY'
+          import ctypes
+          import sys
 
-          if [[ -z "$found" ]]; then
-            echo 'ERROR: No Cronet shared library was produced.'
-            echo 'All shared libraries under the output directory:'
-            find "$OUT_DIR" -type f -name '*.so' -print | head -200 || true
-            exit 1
-          fi
+          library = ctypes.CDLL(sys.argv[1])
+          library.Cronet_Engine_Create.restype = ctypes.c_void_p
+          library.Cronet_Engine_Destroy.argtypes = [ctypes.c_void_p]
+          engine = library.Cronet_Engine_Create()
+          if not engine:
+              raise SystemExit("Cronet_Engine_Create returned null")
+          library.Cronet_Engine_Destroy(engine)
+          print("Cronet C API load/create/destroy smoke test passed")
+          PY
 
-          echo "Found: $found"
-          cp -L "$found" /home/runner/cronet-artifact/libcronet.so
-
-          file /home/runner/cronet-artifact/libcronet.so
-          readelf -h /home/runner/cronet-artifact/libcronet.so
-
-          file /home/runner/cronet-artifact/libcronet.so | grep -Eq 'ELF 64-bit.*x86-64'
-
-          sha256sum /home/runner/cronet-artifact/libcronet.so \
-            | tee /home/runner/cronet-artifact/SHA256SUMS.txt
-
+          (cd "$GITHUB_WORKSPACE" && sha256sum libcronet.so > SHA256SUMS.txt)
           {
-            echo "Chromium revision: $(git -C "$CHROMIUM_SRC" rev-parse HEAD)"
-            echo "Chromium version: $(tr '\n' ' ' < "$CHROMIUM_SRC/chrome/VERSION")"
-            echo "Runner: ubuntu-latest"
-            echo "Architecture: x86_64"
-            echo "GN target: //components/cronet:cronet"
-            echo "Source library: $found"
-          } > /home/runner/cronet-artifact/build-info.txt
+            printf 'Chromium version: %s\n' "$CHROMIUM_VERSION"
+            printf 'Chromium revision: %s\n' "$CHROMIUM_REVISION"
+            printf 'Native bridge revision: %s\n' "$NAIVEPROXY_REF"
+            printf 'GN target: //components/cronet:cronet\n'
+            printf 'Architecture: x86_64\n'
+            printf 'Runner: ubuntu-24.04\n'
+          } > "$GITHUB_WORKSPACE/build-info.txt"
 
-      - name: Upload Cronet artifact
+      - name: Upload libcronet.so and build metadata
         uses: actions/upload-artifact@v4
         with:
-          name: cronet-linux-x64-latest
-          path: /home/runner/cronet-artifact
+          name: cronet-linux-x64-${{ env.CHROMIUM_VERSION }}
+          path: |
+            libcronet.so
+            SHA256SUMS.txt
+            build-info.txt
+            chromium_revision.txt
+            library-file.txt
           if-no-files-found: error
           compression-level: 0
-          retention-days: 7
-
-      - name: Upload build metadata
-        uses: actions/upload-artifact@v4
-        with:
-          name: cronet-linux-x64-build-metadata
-          path: |
-            /home/runner/chromium_revision.txt
-            /home/runner/chromium_version.txt
-            /home/runner/cronet_target_desc.txt
-          if-no-files-found: warn
           retention-days: 7
