@@ -207,6 +207,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          cd "$CHROMIUM_SRC"
           mkdir -p "$OUT_DIR"
           cat > "$OUT_DIR/args.gn" <<'EOF'
           target_os = "linux"
